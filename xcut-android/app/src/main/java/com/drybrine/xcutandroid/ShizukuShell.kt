@@ -9,7 +9,29 @@ data class ShellResult(val exit: Int, val stdout: String, val stderr: String)
 
 object ShizukuShell {
 
-    /** Run a shell command as the Shizuku server uid (ADB shell, uid 2000). */
+    /**
+     * Shizuku 13.x made Shizuku.newProcess private; the binder API behind it
+     * is unchanged, so we reach it through reflection. Returns a real
+     * java.lang.Process (ShizukuRemoteProcess).
+     */
+    private val newProcessMethod: java.lang.reflect.Method by lazy {
+        Shizuku::class.java
+            .getDeclaredMethod(
+                "newProcess",
+                Array<String>::class.java,
+                Array<String>::class.java,
+                String::class.java,
+            )
+            .apply { isAccessible = true }
+    }
+
+    /** Start a command as the Shizuku server uid (ADB shell, uid 2000). */
+    fun start(command: String): Process {
+        val proc = newProcessMethod.invoke(null, arrayOf("/system/bin/sh", "-c", command), null, null)
+        return proc as Process
+    }
+
+    /** Run a shell command to completion as the Shizuku server uid. */
     suspend fun run(command: String): ShellResult = withContext(Dispatchers.IO) {
         if (!Shizuku.pingBinder()) {
             return@withContext ShellResult(-1, "", "shizuku binder dead / not started")
@@ -17,7 +39,7 @@ object ShizukuShell {
         val out = StringBuilder()
         val err = StringBuilder()
         val exit = try {
-            val process = Shizuku.newProcess(arrayOf("/system/bin/sh", "-c", command), null, null)
+            val process = start(command)
             val tOut = thread { out.append(process.inputStream.bufferedReader().use { it.readText() }) }
             val tErr = thread { err.append(process.errorStream.bufferedReader().use { it.readText() }) }
             val code = process.waitFor()

