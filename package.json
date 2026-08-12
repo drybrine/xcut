@@ -1,0 +1,23 @@
+{
+  "name": "xcut",
+  "version": "1.0.0",
+  "description": "Linux Wi-Fi/BLE security toolkit: deauth flood, monitor mode, BLE spoof (vendor class, hop/scan). Linux-only - needs kernel-level access (raw sockets, monitor mode, MGMT channel).",
+  "license": "MIT",
+  "type": "module",
+  "os": [
+    "linux"
+  ],
+  "files": [
+    "xcut",
+    "xcut-ble",
+    "xcut-ble-raw"
+  ],
+  "bin": {
+    "xcut": "xcut",
+    "xcut-ble": "xcut-ble",
+    "xcut-ble-raw": "xcut-ble-raw"
+  },
+  "scripts": {
+    "postinstall": "echo 'xcut installed. Kernel deps (iw, aircrack-ng, etc.) still needed - see README or run: ./install.sh --deps-only'"
+  }
+}

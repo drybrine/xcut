@@ -68,6 +68,15 @@ pip install .              # atau: pipx install .
 
 `xcut-ble` otomatis memakai `xcut-ble-raw` dari PATH bila ada.
 
+**Instalasi via npm** (seluruh toolkit, butuh Node.js):
+
+```bash
+npm install -g .           # dari folder repo ini
+```
+
+Bisa juga di-publish ke registry: `npm publish` (sudah ada `package.json` dengan
+mapping `bin`). Dependency kernel tetap wajib — `./install.sh --deps-only`.
+
 > Windows/macOS **tidak didukung** — tools ini butuh akses kernel Linux
 > (raw socket, monitor mode Wi-Fi, MGMT channel BLE).
 
