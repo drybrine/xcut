@@ -29,7 +29,14 @@ menggunakan izin ADB shell (uid 2000).
 | `cut` | ⚠️ tergantung device | `ip neigh replace ... nud permanent` butuh **CAP_NET_ADMIN** — panel capability menampilkan apakah device kamu punya |
 | `uncut` | ⚠️ sama | `ip neigh del` |
 | deauth (monitor mode) | ❌ | stack Wi-Fi Android (vendor HAL) tidak expose nl80211 monitor mode |
-| BLE spam | ❌ | Android pakai Fluoride, bukan BlueZ; payload/MAC adv dibatasi framework |
+| BLE spam | ✅ **tanpa root & tanpa Shizuku** | engine `BleSpammer` (API `BluetoothLeAdvertiser` standar): rotasi payload cepat 20-30ms — Fast Pair / Apple Continuity / generic churn. MAC tetap dikelola stack |
+
+## BLE Spam (v1.2+)
+
+- **Tanpa root, tanpa Shizuku** — murni Android API (mirror konsep dari proyek blespam GPL-3.0, ditulis ulang dari nol sehingga bebas lisensi)
+- Butuh runtime izin: `BLUETOOTH_CONNECT` + `BLUETOOTH_ADVERTISE`
+- Tiga mode: **Fast Pair** (popup Google), **Continuity** (popup AirPods), **generic churn** (UUID random)
+- Batasan platform: MAC tidak bisa di-set manual; beberapa device menolak dengan `ADVERTISE_FAILED_FEATURE_UNSUPPORTED`
 
 ## Phase 2 (kalau lanjut)
 

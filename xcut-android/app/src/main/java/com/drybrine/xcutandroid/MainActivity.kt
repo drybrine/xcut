@@ -1,14 +1,17 @@
 package com.drybrine.xcutandroid
 
+import android.Manifest
 import android.app.Activity
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Typeface
 import android.os.Build
 import android.os.Bundle
-
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import androidx.core.app.ActivityCompat
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -21,6 +24,7 @@ class MainActivity : Activity() {
 
     private val scope = CoroutineScope(Dispatchers.Main)
     private val permissionCode = 1001
+    private val blePermCode = 1002
 
     private lateinit var statusView: TextView
     private lateinit var capView: TextView
@@ -76,6 +80,31 @@ class MainActivity : Activity() {
                     setOnClickListener { scan() }
                 })
                 addView(listView)
+                addView(TextView(this@MainActivity).apply {
+                    text = "--- BLE SPAM (tanpa Shizuku) ---"
+                    typeface = Typeface.DEFAULT_BOLD
+                    setPadding(0, 24, 0, 8)
+                })
+                addView(Button(this@MainActivity).apply {
+                    text = "Spam: Fast Pair"
+                    setOnClickListener { startSpam(SpamType.FASTPAIR) }
+                })
+                addView(Button(this@MainActivity).apply {
+                    text = "Spam: Apple Continuity"
+                    setOnClickListener { startSpam(SpamType.CONTINUITY) }
+                })
+                addView(Button(this@MainActivity).apply {
+                    text = "Spam: Generic churn"
+                    setOnClickListener { startSpam(SpamType.GENERIC) }
+                })
+                addView(Button(this@MainActivity).apply {
+                    text = "Stop BLE spam"
+                    setOnClickListener {
+                        startService(Intent(this@MainActivity, BleSpamService::class.java).apply {
+                            putExtra(BleSpamService.EXTRA_TYPE, BleSpamService.ACTION_STOP)
+                        })
+                    }
+                })
                 addView(logView)
             })
         }
@@ -247,6 +276,45 @@ class MainActivity : Activity() {
                     appendLog("uncut $ip: poison dihentikan (mac asli tak dikenal: $real)")
                 }
             }
+        }
+    }
+
+    private fun startSpam(type: SpamType) {
+        if (Build.VERSION.SDK_INT >= 31) {
+            val perms = arrayOf(
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.BLUETOOTH_ADVERTISE,
+            )
+            if (perms.any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }) {
+                ActivityCompat.requestPermissions(this, perms, blePermCode)
+                pendingSpam = type
+                return
+            }
+        }
+        launchSpam(type)
+    }
+
+    private var pendingSpam: SpamType? = null
+
+    private fun launchSpam(type: SpamType) {
+        val i = Intent(this, BleSpamService::class.java).apply {
+            putExtra(BleSpamService.EXTRA_TYPE, type.name)
+        }
+        if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+        appendLog("BLE spam dimulai: ${type.label}")
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == blePermCode) {
+            val ok = grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+            appendLog("izin BLE: ${if (ok) "GRANTED" else "DENIED"}")
+            if (ok) pendingSpam?.let { launchSpam(it) }
+            pendingSpam = null
         }
     }
 
