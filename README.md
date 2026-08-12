@@ -30,7 +30,7 @@ xcut cut 5                # blokir perangkat nomor 5
 xcut uncut 5              # lepas blokir
 xcut stop                 # restore semua
 
-xcut deauth all           # kick semua client Wi-Fi (wifi Anda ikut putus sementara)
+xcut deauth all           # kick all client Wi-Fi (WiFi Anda mungkin tersendat/stutter)
 xcut deauth stop          # hentikan deauth & kembalikan interface
 
 xcut exclude              # daftar perangkat dikecualikan
