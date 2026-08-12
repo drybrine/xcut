@@ -12,7 +12,11 @@
 set -u
 
 BIN="${BIN:-$(dirname "$(realpath "$0")")}"
-RAW="${DIS_BLE:-$BIN/xcut-ble-raw}"
+# prefer a PATH-installed engine (pip/pipx), fall back to the sibling file
+RAW="${DIS_BLE:-}"
+if [ -z "$RAW" ]; then
+    RAW="$(command -v xcut-ble-raw 2>/dev/null)" || RAW="$BIN/xcut-ble-raw"
+fi
 JAMPID="/tmp/xcut-jam.pid"
 
 usage() {

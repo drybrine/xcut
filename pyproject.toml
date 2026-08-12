@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xcut-ble-raw"
+version = "0.1.0"
+description = "xcut BLE advertising spoof / soft-jam engine (kernel MGMT control channel, stdlib only)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "drybrine" }]
+keywords = ["ble", "bluetooth", "advertising", "mgmt", "xcut"]
+
+[tool.setuptools]
+script-files = ["xcut-ble-raw"]
+
+# install with:
+#   pip install .            (user site-packages)
+#   pipx install .           (isolated, recommended)
+# then `xcut ble on all` etc. resolve xcut-ble-raw from PATH.

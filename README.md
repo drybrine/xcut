@@ -39,6 +39,18 @@ Alat penguji jaringan: **Wi-Fi cut/deauth**, **BLE advertising spoof**, dan **BL
 
 ## Installation
 
+**Otomatis (semua distro Linux)** — script installer mendeteksi paket manager
+(`pacman`/`apt`/`dnf`/`zypper`/`apk`), install dependency, dan pasang tools:
+
+```bash
+./install.sh               # Arch: sudo pacman -S ...; salin ke ~/.local/bin
+./install.sh --system      # pasang ke /usr/local/bin
+./install.sh --no-deps     # hanya salin tools (dependency sudah ada)
+./install.sh --deps-only   # hanya install dependency
+```
+
+**Manual (Arch):**
+
 ```bash
 mkdir -p ~/.local/bin
 install -m755 xcut xcut-ble xcut-ble-raw ~/.local/bin/
@@ -47,6 +59,17 @@ install -m755 xcut xcut-ble xcut-ble-raw ~/.local/bin/
 sudo pacman -S --noconfirm iproute2 iputils dsniff iw aircrack-ng \
      networkmanager python bluez arp-scan mdk4 ethtool wpa_supplicant
 ```
+
+**Engine BLE via pip** (opsional, pengganti salinan manual `xcut-ble-raw`):
+
+```bash
+pip install .              # atau: pipx install .
+```
+
+`xcut-ble` otomatis memakai `xcut-ble-raw` dari PATH bila ada.
+
+> Windows/macOS **tidak didukung** — tools ini butuh akses kernel Linux
+> (raw socket, monitor mode Wi-Fi, MGMT channel BLE).
 
 ## Cara pakai
 
