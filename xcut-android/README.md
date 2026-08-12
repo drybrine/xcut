@@ -25,11 +25,19 @@ menggunakan izin ADB shell (uid 2000).
 
 | Fitur | Status | Keterangan |
 |---|---|---|
-| Scan neighbor | ✅ | baca tabel `ip neigh` (read-only) |
-| `cut` | ⚠️ tergantung device | `ip neigh replace ... nud permanent` butuh **CAP_NET_ADMIN** — panel capability menampilkan apakah device kamu punya |
-| `uncut` | ⚠️ sama | `ip neigh del` |
+| ADB bootstrap (v1.3+) | ✅ **tanpa root, tanpa Shizuku** | pairing wireless debugging in-app (SPAKE2 + TLS 1.3), key disimpan, daemon `xcutd` di-push & start sebagai uid shell |
+| Scan neighbor | ✅ | daemon raw socket (baca → kirim ARP request broadcast) |
+| `cut` | ✅ tanpa Shizuku | daemon `xcutd` AF_PACKET spoof — butuh shell uid (didapat via adb bootstrap) |
+| BLE spam | ✅ tanpa izin apa pun | engine `BleSpammer` (API `BluetoothLeAdvertiser`) |
 | deauth (monitor mode) | ❌ | stack Wi-Fi Android (vendor HAL) tidak expose nl80211 monitor mode |
-| BLE spam | ✅ **tanpa root & tanpa Shizuku** | engine `BleSpammer` (API `BluetoothLeAdvertiser` standar): rotasi payload cepat 20-30ms — Fast Pair / Apple Continuity / generic churn. MAC tetap dikelola stack |
+
+## ADB bootstrap (v1.3+) — pengganti Shizuku
+
+Flow: **Wireless Debugging di Settings** → app cari mDNS endpoint pairing → masukkan 6-digit code → app jalanin protokol pairing (TLS 1.3 + SPAKE2-Ed25519 + AES-GCM, ported from BoringSSL/adb source) → push `xcutd` binary → start sebagai shell uid → semua raw socket berjalan.
+
+- Hanya **Android 11+** (wireless debugging). Android 10 ke bawah: fallback Shizuku.
+- Alur ini sudah diuji end-to-end di JVM (TLS asli + semua lapisan crypto) — test device masih perlu manual.
+- Detil protokol & file reference: `pairing_connection.cpp`, `spake25519.cc` (BoringSSL), `aes_128_gcm.cpp` (AOSP adb).
 
 ## BLE Spam (v1.2+)
 

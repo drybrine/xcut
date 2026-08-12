@@ -75,6 +75,19 @@ class MainActivity : Activity() {
                     setOnClickListener { checkStatus() }
                 })
                 addView(capView)
+                addView(TextView(this@MainActivity).apply {
+                    text = "--- ADB BOOTSTRAP (tanpa Shizuku, Android 11+) ---"
+                    typeface = Typeface.DEFAULT_BOLD
+                    setPadding(0, 16, 0, 8)
+                })
+                addView(Button(this@MainActivity).apply {
+                    text = "1. Pair via wireless debugging"
+                    setOnClickListener { adbPair() }
+                })
+                addView(Button(this@MainActivity).apply {
+                    text = "2. Start daemon (xcutd)"
+                    setOnClickListener { adbStartDaemon() }
+                })
                 addView(Button(this@MainActivity).apply {
                     text = "Scan (raw ARP)"
                     setOnClickListener { scan() }
@@ -131,12 +144,22 @@ class MainActivity : Activity() {
 
     private fun checkStatus() {
         scope.launch {
-            val caps = ShizukuShell.capabilities()
+            val daemonUp = daemon.isUp()
+            var caps = mapOf<String, String>()
+            try {
+                caps = ShizukuShell.capabilities()
+            } catch (e: Exception) {
+                appendLog("shizuku shell gagal: $e")
+            }
             netAdmin = caps["CAP_NET_ADMIN"] == "true"
             netRaw = caps["CAP_NET_RAW"] == "true"
-            statusView.text = "Shizuku binder: ${if (Shizuku.pingBinder()) "LIVE" else "MATI"}"
+            statusView.text = if (daemonUp)
+                "xcutd daemon: LIVE (raw socket)"
+            else
+                "Shizuku binder: ${if (Shizuku.pingBinder()) "LIVE" else "MATI"} | xcutd: mati"
             capView.text = buildString {
-                append("uid shell: ").append(caps["uid"]).append('\n')
+                append("xcutd daemon: ").append(if (daemonUp) "LIVE" else "MATI").append('\n')
+                append("shizuku uid shell: ").append(caps["uid"]).append('\n')
                 append("CapEff: ").append(caps["cap_eff"]).append('\n')
                 append("CAP_NET_RAW  : ").append(netRaw).append('\n')
                 append("CAP_NET_ADMIN: ").append(netAdmin)
@@ -146,9 +169,125 @@ class MainActivity : Activity() {
     }
 
     private fun backendName() =
-        if (netAdmin) "ip neigh (NET_ADMIN)"
-        else if (netRaw) "raw socket (NET_RAW)"
-        else "TIDAK ADA - perlu NET_ADMIN atau NET_RAW"
+        if (daemonUpFlag) "daemon raw socket (xcutd)"
+        else if (netAdmin) "ip neigh via shizuku (NET_ADMIN)"
+        else if (netRaw) "raw socket via shizuku (NET_RAW)"
+        else "TIDAK ADA - jalankan ADB bootstrap atau Shizuku"
+
+    private var daemonUpFlag = false
+    private val daemon = XcutDaemon()
+    private val adb = AdbBootstrap(this)
+    private var pairHost: String? = null
+    private var pairPort = 0
+    private var connectHost: String? = null
+    private var connectPort = 0
+
+    private fun adbPair() {
+        scope.launch {
+            appendLog("mencari wireless debugging... (aktifkan di Developer Options)")
+            val (pairing, connect) = adb.discover()
+            if (pairing.isEmpty() && connect.isEmpty()) {
+                appendLog("tidak ditemukan - pastikan Wireless debugging AKTIF di HP")
+                return@launch
+            }
+            val p = pairing.firstOrNull()
+            val c = connect.firstOrNull()
+            pairHost = p?.host; pairPort = p?.port ?: 0
+            connectHost = c?.host; connectPort = c?.port ?: 0
+            appendLog("pairing: ${p?.host ?: "-"}:${p?.port ?: "-"} | connect: ${c?.host ?: "-"}:${c?.port ?: "-"}")
+            if (p == null) {
+                appendLog("port pairing tidak ditemukan")
+                return@launch
+            }
+            val input = android.widget.EditText(this@MainActivity).apply {
+                hint = "6 digit code dari layar HP"
+                inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            }
+            android.app.AlertDialog.Builder(this@MainActivity)
+                .setTitle("Wireless debugging pairing")
+                .setView(input)
+                .setPositiveButton("Pair") { _, _ ->
+                    val code = input.text.toString().trim()
+                    scope.launch {
+                        try {
+                            appendLog("pairing ke ${pairHost}:$pairPort...")
+                            adb.pair(pairHost!!, pairPort, code)
+                            appendLog("PAIRED OK - key tersimpan")
+                        } catch (e: Exception) {
+                            appendLog("pairing GAGAL: $e")
+                        }
+                    }
+                }
+                .setNegativeButton("Batal", null)
+                .show()
+        }
+    }
+
+    private fun adbStartDaemon() {
+        scope.launch {
+            try {
+                val connect = connectHost
+                if (connect == null) {
+                    appendLog("belum ada endpoint connect - jalankan Pair dulu")
+                    return@launch
+                }
+                val abi = Build.SUPPORTED_ABIS.firstOrNull()
+                    ?: throw IllegalStateException("no abi")
+                val binBytes = assets.open("$abi/arp").use { it.readBytes() }
+                val b64 = java.util.Base64.getEncoder().encodeToString(binBytes)
+                appendLog("push xcutd + start daemon (${binBytes.size} bytes)...")
+                adb.startDaemon(connect, connectPort, b64)
+                appendLog("daemon started, cek koneksi...")
+                if (daemon.isUp()) {
+                    daemonUpFlag = true
+                    appendLog("xcutd LIVE - raw socket siap")
+                } else {
+                    appendLog("daemon tidak merespons - cek logcat")
+                }
+            } catch (e: Exception) {
+                appendLog("start daemon GAGAL: $e")
+            }
+        }
+    }
+
+    private fun scan() {
+        scope.launch {
+            knownMacs.clear()
+            val devices = daemonScan()
+            if (devices.isEmpty()) {
+                val r = ShizukuShell.run("ip neigh")
+                val neighDevices = parseNeigh(r.stdout)
+                val raw = if (netRaw) rawScan() else emptyList()
+                val list = if (netAdmin) neighDevices else if (raw.isNotEmpty()) raw else neighDevices
+                listView.removeAllViews()
+                list.forEach {
+                    if (it.mac.isNotBlank()) knownMacs[it.ip] = it.mac
+                    addRow(it)
+                }
+                if (list.isEmpty()) appendLog("(tidak ada device)")
+            } else {
+                listView.removeAllViews()
+                devices.forEach {
+                    if (it.mac.isNotBlank()) knownMacs[it.ip] = it.mac
+                    addRow(it)
+                }
+                appendLog("scan via daemon: ${devices.size} device")
+            }
+        }
+    }
+
+    private suspend fun daemonScan(): List<Neighbor> {
+        daemonUpFlag = daemon.isUp()
+        if (!daemonUpFlag) return emptyList()
+        return try {
+            daemon.scan()
+        } catch (e: Exception) {
+            appendLog("daemon scan gagal: $e")
+            daemon.close()
+            daemonUpFlag = false
+            emptyList()
+        }
+    }
 
     private fun extractArpBin(): File? {
         arpBin?.takeIf { it.exists() }?.let { return it }
@@ -170,28 +309,6 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun scan() {
-        scope.launch {
-            val r = ShizukuShell.run("ip neigh")
-            val neighDevices = parseNeigh(r.stdout)
-            knownMacs.clear()
-            val devices = if (netAdmin) {
-                neighDevices
-            } else {
-                val raw = rawScan()
-                if (raw.isNotEmpty()) raw else {
-                    appendLog("raw scan kosong, pakai ip neigh")
-                    neighDevices
-                }
-            }
-            listView.removeAllViews()
-            devices.forEach {
-                if (it.mac.isNotBlank()) knownMacs[it.ip] = it.mac
-                addRow(it)
-            }
-            if (devices.isEmpty()) appendLog("(tidak ada device)")
-        }
-    }
 
     private suspend fun rawScan(): List<Neighbor> {
         val bin = extractArpBin() ?: return emptyList()
@@ -237,7 +354,16 @@ class MainActivity : Activity() {
 
     private fun cut(ip: String, dev: String) {
         scope.launch {
-            if (netAdmin) {
+            if (daemonUpFlag) {
+                try {
+                    daemon.spoof(ip)
+                    appendLog("poison $ip via daemon (raw socket)")
+                } catch (e: Exception) {
+                    appendLog("daemon spoof gagal: $e")
+                    daemon.close()
+                    daemonUpFlag = false
+                }
+            } else if (netAdmin) {
                 val r = ShizukuShell.run("ip neigh replace $ip lladdr 00:00:00:00:00:00 dev $dev nud permanent")
                 appendLog("cut $ip -> exit ${r.exit} ${r.stderr.trim()}")
             } else if (netRaw) {
@@ -261,7 +387,20 @@ class MainActivity : Activity() {
 
     private fun uncut(ip: String, dev: String) {
         scope.launch {
-            if (netAdmin) {
+            if (daemonUpFlag) {
+                try {
+                    daemon.stopSpoof()
+                    val real = knownMacs[ip]
+                    if (real != null) {
+                        daemon.restore(ip, real)
+                        appendLog("restore $ip via daemon")
+                    } else {
+                        appendLog("uncut $ip: poison dihentikan (mac asli tak dikenal)")
+                    }
+                } catch (e: Exception) {
+                    appendLog("daemon uncut gagal: $e")
+                }
+            } else if (netAdmin) {
                 val r = ShizukuShell.run("ip neigh del $ip dev $dev")
                 appendLog("uncut $ip -> exit ${r.exit} ${r.stderr.trim()}")
             } else {
