@@ -1,5 +1,5 @@
 {
-  "name": "xcut",
+  "name": "@suryaappq/xcut",
   "version": "1.0.0",
   "description": "Linux Wi-Fi/BLE security toolkit: deauth flood, monitor mode, BLE spoof (vendor class, hop/scan). Linux-only - needs kernel-level access (raw sockets, monitor mode, MGMT channel).",
   "license": "MIT",
