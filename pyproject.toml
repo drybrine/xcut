@@ -4,13 +4,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xcut-ble-raw"
-version = "0.1.0"
+version = "0.2.0"
 description = "xcut BLE advertising spoof / soft-jam engine (kernel MGMT control channel, stdlib only)"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
 authors = [{ name = "drybrine" }]
-keywords = ["ble", "bluetooth", "advertising", "mgmt", "xcut"]
+keywords = ["ble", "bluetooth", "advertising", "mgmt", "xcut", "security", "linux"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: System :: Networking",
+]
+
+[project.urls]
+Repository = "https://github.com/drybrine/xcut"
+Bugs = "https://github.com/drybrine/xcut/issues"
 
 [tool.setuptools]
 script-files = ["xcut-ble-raw"]

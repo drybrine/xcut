@@ -1,16 +1,41 @@
 {
   "name": "@suryaappq/xcut",
-  "version": "1.0.0",
-  "description": "Linux Wi-Fi/BLE security toolkit: deauth flood, monitor mode, BLE spoof (vendor class, hop/scan). Linux-only - needs kernel-level access (raw sockets, monitor mode, MGMT channel).",
+  "version": "1.1.0",
+  "description": "Linux Wi-Fi/BLE security toolkit: ARP cut, deauth flood (aireplay/mdk4), monitor mode, BLE spoof (vendor class, hop/scan), soft-jam. Linux-only - needs kernel-level access (raw sockets, monitor mode, MGMT channel).",
+  "keywords": [
+    "wifi",
+    "deauth",
+    "arp",
+    "spoof",
+    "cut",
+    "ble",
+    "bluetooth",
+    "advertising",
+    "security",
+    "pentest",
+    "linux"
+  ],
   "license": "MIT",
   "type": "module",
   "os": [
     "linux"
   ],
+  "engines": {
+    "node": ">=14"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/drybrine/xcut.git"
+  },
+  "bugs": {
+    "url": "https://github.com/drybrine/xcut/issues"
+  },
+  "homepage": "https://github.com/drybrine/xcut",
   "files": [
     "xcut",
     "xcut-ble",
-    "xcut-ble-raw"
+    "xcut-ble-raw",
+    "xcut-lib/"
   ],
   "bin": {
     "xcut": "xcut",
@@ -18,6 +43,7 @@
     "xcut-ble-raw": "xcut-ble-raw"
   },
   "scripts": {
+    "test": "tests/run.sh --no-deps",
     "postinstall": "echo 'xcut installed. Kernel deps (iw, aircrack-ng, etc.) still needed - see README or run: ./install.sh --deps-only'"
   }
 }

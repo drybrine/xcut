@@ -6,8 +6,12 @@ Alat penguji jaringan: **Wi-Fi cut/deauth**, **BLE advertising spoof**, dan **BL
 
 ## Fitur
 
-- `scan` / `list` — menemukan perangkat aktif di subnet
-- `cut` / `uncut` / `stop` — blokir perangkat lewat ARP spoofing (tidak menembus AP isolation)
+- `scan` / `list` — menemukan perangkat aktif di subnet (kolom vendor OUI otomatis)
+- `scan -w` / `--watch` — pindai berulang, tampilkan diff perangkat baru/hilang
+- `scan --v6` — selain ARP, ikut mendeteksi neighbor IPv6 (NDP)
+- `list` / `scan` dengan `--json` — output JSON untuk scripting
+- `status` — ringkasan: jumlah perangkat, yang sedang diblokir, status deauth
+- `cut` / `uncut` / `stop` — blokir perangkat lewat ARP spoofing (tidak menembus AP isolation); Ctrl+C saat `cut all` otomatis merestore semua
 - `deauth <nr|ip|all>` — tendang perangkat dari Wi-Fi via monitor mode (`aireplay-ng`, butuh `aircrack-ng`), diakhiri dengan `deauth stop`
 - `exclude` — daftar perangkat yang dilewati dari `cut all` / `deauth all`
 - `ble spam` — spoof advertising BLE (AirPods, AirTag, Samsung, dll.) lewat MGMT channel
@@ -84,7 +88,13 @@ mapping `bin`). Dependency kernel tetap wajib — `./install.sh --deps-only`.
 
 ```bash
 xcut scan                 # pindai perangkat di subnet
+xcut scan -w              # watch mode: pindai tiap 15 detik, tampilkan perangkat baru/hilang
+xcut scan --v6            # sertakan neighbor IPv6 (NDP)
+xcut scan --json          # hasil scan sebagai JSON
 xcut list                 # tampilkan hasil scan (bernomer)
+xcut list --json          # hasil scan terakhir sebagai JSON
+xcut status               # apa yang sedang diblokir + status deauth
+xcut status --json
 xcut cut 5                # blokir perangkat nomor 5
 xcut uncut 5              # lepas blokir
 xcut stop                 # restore semua
@@ -100,17 +110,40 @@ xcut exclude -7           # hapus dari daftar
 
 xcut ble scan             # scan perangkat BLE di sekitar
 xcut ble on all           # spoof berbagai advertising BLE secara bersamaan
+xcut ble conn all         # iklan CONNECTABLE (ADV_IND): perangkat sekitar
+                          # dikirimi prompt koneksi ke payload palsu (request-conn spam)
 xcut ble jam <MAC>        # soft-jam: burst global + connect-flood target
 xcut ble jam stop         # hentikan semua
 ```
 
-> Perintah butuh root — `xcut` otomatis meminta sudo saat diperlukan.
+> Perintah butuh root — `xcut` otomatis meminta sudo saat diperlukan
+> (`list`, `status`, dan `ble scan` tidak butuh root).
+
+## Testing
+
+```bash
+./tests/run.sh             # install bats + pytest (jika belum ada) lalu jalankan semua test
+./tests/run.sh --no-deps   # hanya jalankan test (tanpa install)
+```
+
+- `tests/xcut.bats` — unit test bash (resolve target, exclude, freq2ch, vendor OUI, JSON, status) — tanpa root & tanpa hardware
+- `tests/test_ble_raw.py` — unit test engine BLE (payload adv, format, batas 31 byte)
+
+## Env
+
+| Variabel       | Fungsi                                    |
+|----------------|-------------------------------------------|
+| `WATCH_EVERY`  | interval `scan -w` (detik, default 15)    |
+| `XCUT_NAMES=0` | matikan lookup nama (getent/avahi)        |
+| `NO_COLOR`     | matikan warna output                      |
+| `XCUT_CACHE_DIR` | lokasi cache state (default `~/.local/share/xcut`) |
 
 ## Struktur
 
 | File           | Peran                                                    |
 |----------------|----------------------------------------------------------|
 | `xcut`         | CLI utama: scan / cut / deauth / stop / exclude / ble   |
+| `xcut-lib/`    | Pustaka bersama: `vendor.sh` (OUI), `wifi.sh` (netinfo/neigh), `deauth.sh` (engine deauth) |
 | `xcut-ble`     | Orkestrator BLE: on / off / check / scan / burst / jam   |
 | `xcut-ble-raw` | Engine python MGMT control channel (advertising + burst) |
 

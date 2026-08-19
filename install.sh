@@ -73,8 +73,18 @@ fi
 
 # ---- copy the tools ----
 echo "== installing tools to $DEST =="
-mkdir -p "$DEST"
-install -m755 xcut xcut-ble xcut-ble-raw "$DEST"/
+# /usr/local/bin needs root regardless of --no-deps; sudo ONLY the file copy.
+COPY_SUDO=""
+if [ "$(id -u)" -ne 0 ] && [ "$DEST" = "/usr/local/bin" ]; then
+    COPY_SUDO="sudo"
+fi
+$COPY_SUDO mkdir -p "$DEST"
+$COPY_SUDO install -m755 xcut xcut-ble xcut-ble-raw "$DEST"/
+# xcut sources xcut-lib/*.sh from a dir next to itself (or the system share)
+LIBDIR="$DEST/xcut-lib"
+[ "$DEST" = "/usr/local/bin" ] && LIBDIR="/usr/local/share/xcut/lib"
+$COPY_SUDO mkdir -p "$LIBDIR"
+$COPY_SUDO install -m644 xcut-lib/vendor.sh xcut-lib/wifi.sh xcut-lib/deauth.sh "$LIBDIR"/
 [ "$DEST" != "/usr/local/bin" ] && \
     echo "  PATH: add '$DEST' if not already there (echo 'export PATH=\"\$PATH:$DEST\"' >> ~/.bashrc)"
 
